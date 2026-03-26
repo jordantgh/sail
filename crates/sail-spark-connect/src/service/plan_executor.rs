@@ -527,7 +527,7 @@ pub(crate) async fn handle_execute_checkpoint_command(
     let store = ctx.extension::<CheckpointStore>()?;
     let CheckpointCommand {
         relation,
-        local,
+        local: _,
         eager,
         storage_level: _,
     } = checkpoint;
@@ -538,12 +538,7 @@ pub(crate) async fn handle_execute_checkpoint_command(
         ));
     }
 
-    if !local {
-        return Err(SparkError::unsupported(
-            "non-local checkpoint is not supported",
-        ));
-    }
-
+    // Sail currently serves both checkpoint variants from the same session-scoped cache.
     let relation = relation.required("checkpoint relation")?;
     let plan: spec::Plan = relation.try_into()?;
     let plan = match plan {
