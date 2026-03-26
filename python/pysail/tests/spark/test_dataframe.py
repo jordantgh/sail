@@ -70,3 +70,22 @@ def test_dataframe_drop(spark):
             {"a.b.c": "int32"}
         ),
     )
+
+
+@pytest.mark.parametrize("method_name", ["checkpoint", "localCheckpoint"])
+def test_checkpoint_materializes_temp_view_input(spark, method_name):
+    source = spark.createDataFrame([(1, "alpha"), (2, "beta"), (3, "gamma")], ["id", "value"])
+    source.createOrReplaceTempView("checkpoint_source")
+
+    df = spark.table("checkpoint_source").where(col("id") >= 2)
+    checkpointed = getattr(df, method_name)()
+
+    spark.catalog.dropTempView("checkpoint_source")
+
+    assert_frame_equal(
+        checkpointed.orderBy("id").toPandas(),
+        pd.DataFrame({"id": [2, 3], "value": ["beta", "gamma"]}).astype({"id": "int64"}),
+    )
+
+    with pytest.raises(Exception, match=r"TABLE_OR_VIEW_NOT_FOUND|not found|unknown"):
+        df.collect()
