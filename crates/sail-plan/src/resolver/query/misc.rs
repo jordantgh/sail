@@ -9,7 +9,8 @@ use sail_common::spec;
 use sail_common_datafusion::array::record_batch::{cast_record_batch, read_record_batches};
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::literal::LiteralEvaluator;
-use sail_common_datafusion::session::checkpoint::CheckpointStore;
+use sail_common_datafusion::rename::logical_plan::rename_logical_plan;
+use sail_common_datafusion::session::checkpoint::{CheckpointEntry, CheckpointStore};
 use sail_logical_plan::range::RangeNode;
 
 use crate::error::{PlanError, PlanResult};
@@ -146,17 +147,27 @@ impl PlanResolver<'_> {
         state: &mut PlanResolverState,
     ) -> PlanResult<LogicalPlan> {
         let store = self.ctx.extension::<CheckpointStore>()?;
-        let table_provider = store.get(&relation_id)?.ok_or_else(|| {
+        let relation = store.get(&relation_id)?.ok_or_else(|| {
             PlanError::AnalysisError(format!("cached relation not found: {relation_id}"))
         })?;
-        self.resolve_table_provider_with_rename(
-            table_provider,
-            UNNAMED_TABLE,
-            None,
-            vec![],
-            None,
-            state,
-        )
+        match relation {
+            CheckpointEntry::Materialized(table_provider) => self
+                .resolve_table_provider_with_rename(
+                    table_provider,
+                    UNNAMED_TABLE,
+                    None,
+                    vec![],
+                    None,
+                    state,
+                ),
+            CheckpointEntry::Plan { plan, fields } => {
+                let names = fields
+                    .into_iter()
+                    .map(|field| state.register_field_name(field))
+                    .collect::<Vec<_>>();
+                Ok(rename_logical_plan(plan, &names)?)
+            }
+        }
     }
 
     pub(super) async fn resolve_query_hint(

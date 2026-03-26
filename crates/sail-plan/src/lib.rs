@@ -31,14 +31,22 @@ pub async fn execute_logical_plan(ctx: &SessionContext, plan: LogicalPlan) -> Re
     Ok(df)
 }
 
+pub async fn resolve_named_plan(
+    ctx: &SessionContext,
+    config: Arc<PlanConfig>,
+    plan: spec::Plan,
+) -> PlanResult<NamedPlan> {
+    let resolver = PlanResolver::new(ctx, config);
+    resolver.resolve_named_plan(plan).await
+}
+
 pub async fn resolve_and_execute_plan(
     ctx: &SessionContext,
     config: Arc<PlanConfig>,
     plan: spec::Plan,
 ) -> PlanResult<(Arc<dyn ExecutionPlan>, Vec<StringifiedPlan>)> {
     let mut info = vec![];
-    let resolver = PlanResolver::new(ctx, config);
-    let NamedPlan { plan, fields } = resolver.resolve_named_plan(plan).await?;
+    let NamedPlan { plan, fields } = resolve_named_plan(ctx, config, plan).await?;
     info.push(plan.to_stringified(PlanType::InitialLogicalPlan));
     let df = execute_logical_plan(ctx, plan).await?;
     let (session_state, plan) = df.into_parts();

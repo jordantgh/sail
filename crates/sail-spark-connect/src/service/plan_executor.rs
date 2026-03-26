@@ -12,9 +12,9 @@ use futures::stream;
 use log::{debug, warn};
 use sail_common::spec;
 use sail_common_datafusion::extension::SessionExtensionAccessor;
-use sail_common_datafusion::session::checkpoint::CheckpointStore;
+use sail_common_datafusion::session::checkpoint::{CheckpointEntry, CheckpointStore};
 use sail_common_datafusion::session::job::JobService;
-use sail_plan::resolve_and_execute_plan;
+use sail_plan::{resolve_and_execute_plan, resolve_named_plan};
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use tonic::codegen::tokio_stream::Stream;
 use tonic::Status;
@@ -532,12 +532,6 @@ pub(crate) async fn handle_execute_checkpoint_command(
         storage_level: _,
     } = checkpoint;
 
-    if !eager {
-        return Err(SparkError::unsupported(
-            "non-eager checkpoint is not supported",
-        ));
-    }
-
     // Sail currently serves both checkpoint variants from the same session-scoped cache.
     let relation = relation.required("checkpoint relation")?;
     let plan: spec::Plan = relation.try_into()?;
@@ -549,12 +543,22 @@ pub(crate) async fn handle_execute_checkpoint_command(
             ))
         }
     };
-    let (plan, _) = resolve_and_execute_plan(ctx, spark.plan_config()?, plan).await?;
-    let stream = service.runner().execute(ctx, plan).await?;
-    let schema = stream.schema();
-    let batches = read_stream(stream).await?;
     let relation_id = uuid::Uuid::new_v4().to_string();
-    let relation: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema, vec![batches])?);
+    let relation = if eager {
+        let (plan, _) = resolve_and_execute_plan(ctx, spark.plan_config()?, plan).await?;
+        let stream = service.runner().execute(ctx, plan).await?;
+        let schema = stream.schema();
+        let batches = read_stream(stream).await?;
+        let relation: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema, vec![batches])?);
+        CheckpointEntry::Materialized(relation)
+    } else {
+        let sail_plan::resolver::plan::NamedPlan { plan, fields } =
+            resolve_named_plan(ctx, spark.plan_config()?, plan).await?;
+        let fields = fields.ok_or_else(|| {
+            SparkError::invalid("checkpoint relation must resolve to a query plan")
+        })?;
+        CheckpointEntry::Plan { plan, fields }
+    };
     let _ = store.insert(relation_id.clone(), relation)?;
 
     let result = CheckpointCommandResult {

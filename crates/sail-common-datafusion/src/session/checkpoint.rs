@@ -3,12 +3,22 @@ use std::sync::{Arc, Mutex};
 
 use datafusion::datasource::TableProvider;
 use datafusion_common::internal_datafusion_err;
+use datafusion_expr::LogicalPlan;
 
 use crate::extension::SessionExtension;
 
+#[derive(Clone)]
+pub enum CheckpointEntry {
+    Materialized(Arc<dyn TableProvider>),
+    Plan {
+        plan: LogicalPlan,
+        fields: Vec<String>,
+    },
+}
+
 /// Session-scoped storage for server-side cached relations such as Spark Connect checkpoints.
 pub struct CheckpointStore {
-    relations: Mutex<HashMap<String, Arc<dyn TableProvider>>>,
+    relations: Mutex<HashMap<String, CheckpointEntry>>,
 }
 
 impl Default for CheckpointStore {
@@ -27,8 +37,8 @@ impl CheckpointStore {
     pub fn insert(
         &self,
         relation_id: String,
-        relation: Arc<dyn TableProvider>,
-    ) -> datafusion_common::Result<Option<Arc<dyn TableProvider>>> {
+        relation: CheckpointEntry,
+    ) -> datafusion_common::Result<Option<CheckpointEntry>> {
         let mut relations = self
             .relations
             .lock()
@@ -36,10 +46,7 @@ impl CheckpointStore {
         Ok(relations.insert(relation_id, relation))
     }
 
-    pub fn get(
-        &self,
-        relation_id: &str,
-    ) -> datafusion_common::Result<Option<Arc<dyn TableProvider>>> {
+    pub fn get(&self, relation_id: &str) -> datafusion_common::Result<Option<CheckpointEntry>> {
         let relations = self
             .relations
             .lock()
@@ -47,10 +54,7 @@ impl CheckpointStore {
         Ok(relations.get(relation_id).cloned())
     }
 
-    pub fn remove(
-        &self,
-        relation_id: &str,
-    ) -> datafusion_common::Result<Option<Arc<dyn TableProvider>>> {
+    pub fn remove(&self, relation_id: &str) -> datafusion_common::Result<Option<CheckpointEntry>> {
         let mut relations = self
             .relations
             .lock()
