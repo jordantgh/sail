@@ -7,7 +7,9 @@ use datafusion_expr::{EmptyRelation, Extension, LogicalPlan, UNNAMED_TABLE};
 use log::warn;
 use sail_common::spec;
 use sail_common_datafusion::array::record_batch::{cast_record_batch, read_record_batches};
+use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::literal::LiteralEvaluator;
+use sail_common_datafusion::session::checkpoint::CheckpointStore;
 use sail_logical_plan::range::RangeNode;
 
 use crate::error::{PlanError, PlanResult};
@@ -128,6 +130,25 @@ impl PlanResolver<'_> {
             return Err(PlanError::invalid("missing schema for local relation"));
         };
         let table_provider = Arc::new(MemTable::try_new(schema, vec![batches])?);
+        self.resolve_table_provider_with_rename(
+            table_provider,
+            UNNAMED_TABLE,
+            None,
+            vec![],
+            None,
+            state,
+        )
+    }
+
+    pub(super) async fn resolve_query_cached_remote_relation(
+        &self,
+        relation_id: String,
+        state: &mut PlanResolverState,
+    ) -> PlanResult<LogicalPlan> {
+        let store = self.ctx.extension::<CheckpointStore>()?;
+        let table_provider = store.get(&relation_id)?.ok_or_else(|| {
+            PlanError::AnalysisError(format!("cached relation not found: {relation_id}"))
+        })?;
         self.resolve_table_provider_with_rename(
             table_provider,
             UNNAMED_TABLE,

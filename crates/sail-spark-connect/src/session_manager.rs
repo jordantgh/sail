@@ -8,6 +8,7 @@ use datafusion::prelude::SessionConfig;
 use sail_common::config::AppConfig;
 use sail_common::runtime::RuntimeHandle;
 use sail_common_datafusion::catalog::display::DefaultCatalogDisplay;
+use sail_common_datafusion::session::checkpoint::CheckpointStore;
 use sail_common_datafusion::session::plan::PlanService;
 use sail_plan::catalog::SparkCatalogObjectDisplay;
 use sail_plan::formatter::SparkPlanFormatter;
@@ -46,6 +47,7 @@ impl ServerSessionMutator for SparkSessionMutator {
         .map_err(|e| internal_datafusion_err!("{e}"))?;
         Ok(config
             .with_extension(Arc::new(plan_service))
+            .with_extension(Arc::new(CheckpointStore::default()))
             .with_extension(Arc::new(spark)))
     }
 

@@ -1,7 +1,9 @@
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use datafusion::arrow::compute::concat_batches;
+use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::prelude::SessionContext;
 use fastrace::collector::SpanContext;
 use fastrace::future::FutureExt;
@@ -10,6 +12,7 @@ use futures::stream;
 use log::{debug, warn};
 use sail_common::spec;
 use sail_common_datafusion::extension::SessionExtensionAccessor;
+use sail_common_datafusion::session::checkpoint::CheckpointStore;
 use sail_common_datafusion::session::job::JobService;
 use sail_plan::resolve_and_execute_plan;
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
@@ -26,10 +29,11 @@ use crate::spark::connect::execute_plan_response::{
     ResponseType, ResultComplete, SqlCommandResult,
 };
 use crate::spark::connect::{
-    relation, CheckpointCommand, CheckpointCommandResult, CommonInlineUserDefinedDataSource,
-    CommonInlineUserDefinedFunction, CommonInlineUserDefinedTableFunction,
-    CreateDataFrameViewCommand, ExecutePlanResponse, GetResourcesCommand, LocalRelation,
-    MergeIntoTableCommand, Relation, SqlCommand, StreamingQueryCommand,
+    relation, CachedRemoteRelation, CheckpointCommand, CheckpointCommandResult,
+    CommonInlineUserDefinedDataSource, CommonInlineUserDefinedFunction,
+    CommonInlineUserDefinedTableFunction, CreateDataFrameViewCommand, ExecutePlanResponse,
+    GetResourcesCommand, LocalRelation, MergeIntoTableCommand, Relation,
+    RemoveCachedRemoteRelationCommand, SqlCommand, StreamingQueryCommand,
     StreamingQueryCommandResult, StreamingQueryListenerBusCommand, StreamingQueryManagerCommand,
     StreamingQueryManagerCommandResult, WriteOperation, WriteOperationV2,
     WriteStreamOperationStart, WriteStreamOperationStartResult,
@@ -515,16 +519,75 @@ pub(crate) async fn handle_execute_streaming_query_listener_bus_command(
 
 pub(crate) async fn handle_execute_checkpoint_command(
     ctx: &SessionContext,
-    _checkpoint: CheckpointCommand,
+    checkpoint: CheckpointCommand,
     metadata: ExecutorMetadata,
 ) -> SparkResult<ExecutePlanResponseStream> {
-    // TODO: Implement
-    warn!("Checkpoint operation is not yet supported and is a no-op");
     let spark = ctx.extension::<SparkSession>()?;
-    let result = CheckpointCommandResult { relation: None };
+    let service = ctx.extension::<JobService>()?;
+    let store = ctx.extension::<CheckpointStore>()?;
+    let CheckpointCommand {
+        relation,
+        local,
+        eager,
+        storage_level: _,
+    } = checkpoint;
+
+    if !eager {
+        return Err(SparkError::unsupported(
+            "non-eager checkpoint is not supported",
+        ));
+    }
+
+    if !local {
+        return Err(SparkError::unsupported(
+            "non-local checkpoint is not supported",
+        ));
+    }
+
+    let relation = relation.required("checkpoint relation")?;
+    let plan: spec::Plan = relation.try_into()?;
+    let plan = match plan {
+        spec::Plan::Query(plan) => spec::Plan::Query(plan),
+        spec::Plan::Command(_) => {
+            return Err(SparkError::invalid(
+                "checkpoint relation must resolve to a query plan",
+            ))
+        }
+    };
+    let (plan, _) = resolve_and_execute_plan(ctx, spark.plan_config()?, plan).await?;
+    let stream = service.runner().execute(ctx, plan).await?;
+    let schema = stream.schema();
+    let batches = read_stream(stream).await?;
+    let relation_id = uuid::Uuid::new_v4().to_string();
+    let relation: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema, vec![batches])?);
+    let _ = store.insert(relation_id.clone(), relation)?;
+
+    let result = CheckpointCommandResult {
+        relation: Some(CachedRemoteRelation { relation_id }),
+    };
     let mut output = vec![ExecutorOutput::new(ExecutorBatch::CheckpointCommandResult(
         Box::new(result),
     ))];
+    if metadata.reattachable {
+        output.push(ExecutorOutput::complete());
+    }
+    Ok(ExecutePlanResponseStream::new(
+        spark.session_id().to_string(),
+        metadata.operation_id,
+        Box::pin(stream::iter(output)),
+    ))
+}
+
+pub(crate) async fn handle_execute_remove_cached_remote_relation_command(
+    ctx: &SessionContext,
+    command: RemoveCachedRemoteRelationCommand,
+    metadata: ExecutorMetadata,
+) -> SparkResult<ExecutePlanResponseStream> {
+    let spark = ctx.extension::<SparkSession>()?;
+    let store = ctx.extension::<CheckpointStore>()?;
+    let relation = command.relation.required("cached remote relation")?;
+    let _ = store.remove(&relation.relation_id)?;
+    let mut output = vec![];
     if metadata.reattachable {
         output.push(ExecutorOutput::complete());
     }
