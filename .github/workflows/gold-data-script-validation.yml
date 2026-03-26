@@ -2,13 +2,12 @@ name: Gold Data Script Validation
 
 on:
   push:
-    branches: [main]
     paths:
       - "scripts/spark-gold-data/**"
   pull_request:
-    branches: [main]
     paths:
       - "scripts/spark-gold-data/**"
+  workflow_dispatch:
 
 jobs:
   validate:

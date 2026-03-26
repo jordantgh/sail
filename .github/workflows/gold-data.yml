@@ -2,11 +2,10 @@ name: Gold Data
 
 on:
   push:
-    branches: [main]
   pull_request:
-    branches: [main]
     paths:
       - "**/gold_data/**"
+  workflow_dispatch:
 
 jobs:
   run:
