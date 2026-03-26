@@ -6,10 +6,12 @@ use datafusion_common::{DFSchema, DFSchemaRef, ParamValues};
 use datafusion_expr::{EmptyRelation, Extension, LogicalPlan, UNNAMED_TABLE};
 use log::warn;
 use sail_common::spec;
-use sail_common_datafusion::array::record_batch::{cast_record_batch, read_record_batches};
+use sail_common_datafusion::array::record_batch::{
+    cast_record_batch, read_record_batches, record_batch_with_schema,
+};
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::literal::LiteralEvaluator;
-use sail_common_datafusion::rename::logical_plan::rename_logical_plan;
+use sail_common_datafusion::rename::schema::rename_schema;
 use sail_common_datafusion::session::checkpoint::{CheckpointEntry, CheckpointStore};
 use sail_logical_plan::range::RangeNode;
 
@@ -160,12 +162,58 @@ impl PlanResolver<'_> {
                     None,
                     state,
                 ),
-            CheckpointEntry::Plan { plan, fields } => {
-                let names = fields
-                    .into_iter()
-                    .map(|field| state.register_field_name(field))
-                    .collect::<Vec<_>>();
-                Ok(rename_logical_plan(plan, &names)?)
+            CheckpointEntry::Plan { .. } => {
+                // Take ownership of the lazy checkpoint entry so the store mutex is not held
+                // while we execute the plan and collect its batches.
+                let relation = store.remove(&relation_id)?.ok_or_else(|| {
+                    PlanError::AnalysisError(format!("cached relation not found: {relation_id}"))
+                })?;
+                let table_provider = match relation {
+                    CheckpointEntry::Materialized(table_provider) => table_provider,
+                    CheckpointEntry::Plan { plan, fields } => {
+                        let schema = rename_schema(plan.schema().as_arrow(), &fields)?;
+                        let materialized = async {
+                            let batches = self
+                                .ctx
+                                .execute_logical_plan(plan.clone())
+                                .await?
+                                .collect()
+                                .await?;
+                            let batches = batches
+                                .into_iter()
+                                .map(|batch| record_batch_with_schema(batch, &schema))
+                                .collect::<datafusion_common::Result<Vec<_>>>()?;
+                            Ok::<Arc<dyn datafusion::datasource::TableProvider>, PlanError>(
+                                Arc::new(MemTable::try_new(schema, vec![batches])?),
+                            )
+                        }
+                        .await;
+                        match materialized {
+                            Ok(table_provider) => {
+                                let _ = store.insert(
+                                    relation_id.clone(),
+                                    CheckpointEntry::Materialized(table_provider.clone()),
+                                )?;
+                                table_provider
+                            }
+                            Err(error) => {
+                                let _ = store.insert(
+                                    relation_id.clone(),
+                                    CheckpointEntry::Plan { plan, fields },
+                                )?;
+                                return Err(error);
+                            }
+                        }
+                    }
+                };
+                self.resolve_table_provider_with_rename(
+                    table_provider,
+                    UNNAMED_TABLE,
+                    None,
+                    vec![],
+                    None,
+                    state,
+                )
             }
         }
     }
