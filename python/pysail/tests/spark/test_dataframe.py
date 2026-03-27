@@ -70,3 +70,41 @@ def test_dataframe_drop(spark):
             {"a.b.c": "int32"}
         ),
     )
+
+
+@pytest.mark.parametrize("method_name", ["checkpoint", "localCheckpoint"])
+def test_checkpoint_materializes_temp_view_input(spark, method_name, tmp_path):
+    source = spark.createDataFrame([(1, "alpha"), (2, "beta"), (3, "gamma")], ["id", "value"])
+    source.createOrReplaceTempView("checkpoint_source")
+
+    df = spark.table("checkpoint_source").where(col("id") >= 2)
+    if method_name == "checkpoint":
+        spark.conf.set("spark.checkpoint.dir", (tmp_path / "checkpoint-dir").as_uri())
+    checkpointed = getattr(df, method_name)()
+
+    spark.catalog.dropTempView("checkpoint_source")
+
+    assert_frame_equal(
+        checkpointed.orderBy("id").toPandas(),
+        pd.DataFrame({"id": [2, 3], "value": ["beta", "gamma"]}).astype({"id": "int64"}),
+    )
+
+    with pytest.raises(Exception, match=r"TABLE_OR_VIEW_NOT_FOUND|not found|unknown"):
+        df.collect()
+
+
+@pytest.mark.parametrize("method_name", ["checkpoint", "localCheckpoint"])
+def test_checkpoint_lazy_matches_doctest_and_executes(spark, method_name):
+    source = spark.createDataFrame([(14, "Tom"), (23, "Alice"), (16, "Bob")], ["age", "name"])
+    source.createOrReplaceTempView("lazy_checkpoint_source")
+
+    df = spark.table("lazy_checkpoint_source")
+    checkpointed = getattr(df, method_name)(False)
+
+    expected = pd.DataFrame({"age": [14, 16, 23], "name": ["Tom", "Bob", "Alice"]})
+
+    assert repr(checkpointed) == "DataFrame[age: bigint, name: string]"
+    assert_frame_equal(
+        checkpointed.orderBy("age").toPandas(),
+        expected,
+    )
