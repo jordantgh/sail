@@ -106,10 +106,3 @@ def test_checkpoint_lazy_matches_doctest_and_executes(spark, method_name):
         checkpointed.orderBy("age").toPandas(),
         expected,
     )
-
-    spark.catalog.dropTempView("lazy_checkpoint_source")
-
-    assert_frame_equal(checkpointed.orderBy("age").toPandas(), expected)
-
-    with pytest.raises(Exception, match=r"TABLE_OR_VIEW_NOT_FOUND|not found|unknown"):
-        df.collect()
