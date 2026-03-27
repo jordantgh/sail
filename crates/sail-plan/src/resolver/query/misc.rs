@@ -6,9 +6,7 @@ use datafusion_common::{DFSchema, DFSchemaRef, ParamValues};
 use datafusion_expr::{EmptyRelation, Extension, LogicalPlan, UNNAMED_TABLE};
 use log::warn;
 use sail_common::spec;
-use sail_common_datafusion::array::record_batch::{
-    cast_record_batch, read_record_batches,
-};
+use sail_common_datafusion::array::record_batch::{cast_record_batch, read_record_batches};
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::literal::LiteralEvaluator;
 use sail_common_datafusion::rename::logical_plan::rename_logical_plan;
@@ -163,6 +161,10 @@ impl PlanResolver<'_> {
                     state,
                 ),
             RemoteRelationEntry::Deferred { plan, fields } => {
+                let fields = fields
+                    .into_iter()
+                    .map(|field| state.register_field_name(field))
+                    .collect::<Vec<_>>();
                 Ok(rename_logical_plan(plan, &fields)?)
             }
         }
@@ -205,5 +207,92 @@ impl PlanResolver<'_> {
         _state: &mut PlanResolverState,
     ) -> PlanResult<LogicalPlan> {
         Err(PlanError::todo("with watermark"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::execution::SessionStateBuilder;
+    use datafusion::logical_expr::{lit, LogicalPlanBuilder};
+    use datafusion::prelude::SessionContext;
+    use sail_common_datafusion::extension::SessionExtensionAccessor;
+    use sail_common_datafusion::session::remote_relation::{
+        RemoteRelationEntry, RemoteRelationStore,
+    };
+
+    use crate::config::PlanConfig;
+    use crate::error::{PlanError, PlanResult};
+    use crate::resolver::state::PlanResolverState;
+    use crate::resolver::PlanResolver;
+
+    fn create_session() -> SessionContext {
+        let mut state = SessionStateBuilder::new().build();
+        state
+            .config_mut()
+            .set_extension(Arc::new(RemoteRelationStore::default()));
+        SessionContext::new_with_state(state)
+    }
+
+    fn create_deferred_plan() -> datafusion_common::Result<datafusion_expr::LogicalPlan> {
+        LogicalPlanBuilder::empty(false)
+            .project(vec![lit(1_i64).alias("#cached")])?
+            .build()
+    }
+
+    #[tokio::test]
+    async fn test_deferred_remote_relation_registers_current_field_ids() -> PlanResult<()> {
+        let ctx = create_session();
+        let store = ctx.extension::<RemoteRelationStore>()?;
+        store.insert(
+            "deferred".to_string(),
+            RemoteRelationEntry::Deferred {
+                plan: create_deferred_plan()?,
+                fields: vec!["age".to_string()],
+            },
+        )?;
+
+        let resolver = PlanResolver::new(&ctx, Arc::new(PlanConfig::new()?));
+        let mut state = PlanResolverState::new();
+        let plan = resolver
+            .resolve_query_cached_remote_relation("deferred".to_string(), &mut state)
+            .await?;
+
+        resolver.verify_query_plan(&plan, &state)?;
+        let field_id = plan.schema().field(0).name();
+        assert_ne!(field_id, "age");
+        let field = state.get_field_info(field_id)?;
+        assert_eq!(field.name(), "age");
+        assert!(state.get_field_info("age").is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_removed_remote_relation_fails_resolution() -> PlanResult<()> {
+        let ctx = create_session();
+        let store = ctx.extension::<RemoteRelationStore>()?;
+        store.insert(
+            "deferred".to_string(),
+            RemoteRelationEntry::Deferred {
+                plan: create_deferred_plan()?,
+                fields: vec!["age".to_string()],
+            },
+        )?;
+        let _ = store.remove("deferred")?;
+
+        let resolver = PlanResolver::new(&ctx, Arc::new(PlanConfig::new()?));
+        let mut state = PlanResolverState::new();
+        let error = resolver
+            .resolve_query_cached_remote_relation("deferred".to_string(), &mut state)
+            .await
+            .unwrap_err();
+        match error {
+            PlanError::AnalysisError(message) => {
+                assert!(message.contains("cached relation not found"));
+            }
+            other => panic!("expected missing relation analysis error, got {other:?}"),
+        }
+        Ok(())
     }
 }
