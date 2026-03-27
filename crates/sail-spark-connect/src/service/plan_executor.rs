@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use datafusion::arrow::compute::concat_batches;
-use datafusion::datasource::{MemTable, TableProvider};
+use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
 use fastrace::collector::SpanContext;
 use fastrace::future::FutureExt;
@@ -11,7 +11,9 @@ use fastrace::Span;
 use futures::stream;
 use log::{debug, warn};
 use sail_common::spec;
+use sail_common_datafusion::datasource::{SourceInfo, TableFormatRegistry};
 use sail_common_datafusion::extension::SessionExtensionAccessor;
+use sail_common_datafusion::rename::schema::rename_schema;
 use sail_common_datafusion::session::job::JobService;
 use sail_common_datafusion::session::remote_relation::{RemoteRelationEntry, RemoteRelationStore};
 use sail_plan::{resolve_and_execute_plan, resolve_named_plan};
@@ -279,6 +281,54 @@ pub(crate) async fn handle_execute_sql_command(
     ))
 }
 
+#[cfg(test)]
+mod tests {
+    use sail_common::spec;
+
+    use super::build_checkpoint_write_plan;
+
+    #[test]
+    fn test_build_checkpoint_write_plan_uses_parquet_directory_write() {
+        let plan = spec::QueryPlan::new(spec::QueryNode::Range(spec::Range {
+            start: Some(0),
+            end: 3,
+            step: 1,
+            num_partitions: Some(2),
+        }));
+        let checkpoint_location = std::env::temp_dir()
+            .join("checkpoint")
+            .to_string_lossy()
+            .into_owned();
+
+        let checkpoint = build_checkpoint_write_plan(plan, true, checkpoint_location.clone());
+        let spec::Plan::Command(command) = checkpoint else {
+            panic!("checkpoint write plan should be a command");
+        };
+        let spec::CommandNode::InsertOverwriteDirectory {
+            local,
+            location,
+            file_format,
+            row_format,
+            options,
+            ..
+        } = command.node
+        else {
+            panic!("checkpoint should lower to INSERT OVERWRITE DIRECTORY");
+        };
+
+        assert!(local);
+        assert_eq!(location.as_deref(), Some(checkpoint_location.as_str()));
+        assert_eq!(
+            file_format,
+            Some(spec::TableFileFormat::General {
+                format: "parquet".to_string(),
+            })
+        );
+        assert!(row_format.is_none());
+        assert!(options.is_empty());
+    }
+}
+
 pub(crate) async fn handle_execute_write_stream_operation_start(
     ctx: &SessionContext,
     start: WriteStreamOperationStart,
@@ -527,7 +577,7 @@ pub(crate) async fn handle_execute_checkpoint_command(
     let store = ctx.extension::<RemoteRelationStore>()?;
     let CheckpointCommand {
         relation,
-        local: _,
+        local,
         eager,
         storage_level: _,
     } = checkpoint;
@@ -535,8 +585,8 @@ pub(crate) async fn handle_execute_checkpoint_command(
     // Sail currently serves both checkpoint variants from the same session-scoped cache.
     let relation = relation.required("checkpoint relation")?;
     let plan: spec::Plan = relation.try_into()?;
-    let plan = match plan {
-        spec::Plan::Query(plan) => spec::Plan::Query(plan),
+    let query = match plan {
+        spec::Plan::Query(plan) => plan,
         spec::Plan::Command(_) => {
             return Err(SparkError::invalid(
                 "checkpoint relation must resolve to a query plan",
@@ -544,16 +594,22 @@ pub(crate) async fn handle_execute_checkpoint_command(
         }
     };
     let relation_id = uuid::Uuid::new_v4().to_string();
+    let plan_config = spark.plan_config()?;
     let relation = if eager {
-        let (plan, _) = resolve_and_execute_plan(ctx, spark.plan_config()?, plan).await?;
-        let stream = service.runner().execute(ctx, plan).await?;
-        let schema = stream.schema();
-        let batches = read_stream(stream).await?;
-        let relation: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema, vec![batches])?);
+        let location = spark.checkpoint_location(local, &relation_id)?;
+        let relation = materialize_checkpoint_relation(
+            ctx,
+            service,
+            plan_config.clone(),
+            query,
+            local,
+            location,
+        )
+        .await?;
         RemoteRelationEntry::Materialized(relation)
     } else {
         let sail_plan::resolver::plan::NamedPlan { plan, fields } =
-            resolve_named_plan(ctx, spark.plan_config()?, plan).await?;
+            resolve_named_plan(ctx, plan_config, spec::Plan::Query(query)).await?;
         let fields = fields.ok_or_else(|| {
             SparkError::invalid("checkpoint relation must resolve to a query plan")
         })?;
@@ -586,6 +642,7 @@ pub(crate) async fn handle_execute_remove_cached_remote_relation_command(
     let store = ctx.extension::<RemoteRelationStore>()?;
     let relation = command.relation.required("cached remote relation")?;
     let _ = store.remove(&relation.relation_id)?;
+    let _ = spark.remove_local_checkpoint(&relation.relation_id)?;
     let mut output = vec![];
     if metadata.reattachable {
         output.push(ExecutorOutput::complete());
@@ -594,6 +651,68 @@ pub(crate) async fn handle_execute_remove_cached_remote_relation_command(
         spark.session_id().to_string(),
         metadata.operation_id,
         Box::pin(stream::iter(output)),
+    ))
+}
+
+async fn materialize_checkpoint_relation(
+    ctx: &SessionContext,
+    service: &JobService,
+    plan_config: Arc<sail_plan::config::PlanConfig>,
+    query: spec::QueryPlan,
+    local: bool,
+    location: String,
+) -> SparkResult<Arc<dyn TableProvider>> {
+    let sail_plan::resolver::plan::NamedPlan {
+        plan: logical_plan,
+        fields,
+    } = resolve_named_plan(ctx, plan_config.clone(), spec::Plan::Query(query.clone())).await?;
+    let fields = fields
+        .ok_or_else(|| SparkError::invalid("checkpoint relation must resolve to a query plan"))?;
+    let schema = rename_schema(logical_plan.schema().as_arrow(), &fields)?;
+    // Reuse Sail's normal distributed file-write path so eager checkpoints do not
+    // centralize all data on the driver before they become a reusable relation.
+    let write = build_checkpoint_write_plan(query, local, location.clone());
+    let (write, _) = resolve_and_execute_plan(ctx, plan_config, write).await?;
+    let stream = service.runner().execute(ctx, write).await?;
+    let _ = read_stream(stream).await?;
+    build_checkpoint_provider(ctx, location, schema.as_ref().clone()).await
+}
+
+async fn build_checkpoint_provider(
+    ctx: &SessionContext,
+    location: String,
+    schema: datafusion::arrow::datatypes::Schema,
+) -> SparkResult<Arc<dyn TableProvider>> {
+    let registry = ctx.extension::<TableFormatRegistry>()?;
+    Ok(registry
+        .get("parquet")?
+        .create_provider(
+            &ctx.state(),
+            SourceInfo {
+                paths: vec![location],
+                schema: Some(schema),
+                constraints: Default::default(),
+                partition_by: vec![],
+                bucket_by: None,
+                sort_order: vec![],
+                options: vec![],
+            },
+        )
+        .await?)
+}
+
+fn build_checkpoint_write_plan(plan: spec::QueryPlan, local: bool, location: String) -> spec::Plan {
+    spec::Plan::Command(spec::CommandPlan::new(
+        spec::CommandNode::InsertOverwriteDirectory {
+            input: Box::new(plan),
+            local,
+            location: Some(location),
+            file_format: Some(spec::TableFileFormat::General {
+                format: "parquet".to_string(),
+            }),
+            row_format: None,
+            options: vec![],
+        },
     ))
 }
 

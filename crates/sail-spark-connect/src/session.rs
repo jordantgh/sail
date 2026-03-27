@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use datafusion::logical_expr::StringifiedPlan;
 use sail_common::datetime::get_system_timezone;
 use sail_common_datafusion::extension::SessionExtension;
 use sail_plan::config::PlanConfig;
+use tempfile::{Builder as TempDirBuilder, TempDir};
 
 use crate::config::{ConfigKeyValue, SparkRuntimeConfig};
 use crate::error::{SparkError, SparkResult, SparkThrowable};
@@ -22,6 +24,8 @@ use crate::streaming::{
 pub(crate) struct SparkSessionOptions {
     pub execution_heartbeat_interval: Duration,
 }
+
+const SPARK_CHECKPOINT_DIR: &str = "spark.checkpoint.dir";
 
 /// A Spark session extension to the DataFusion [`SessionContext`].
 ///
@@ -152,6 +156,36 @@ impl SparkSession {
     pub(crate) fn get_all_config(&self, prefix: Option<&str>) -> SparkResult<Vec<ConfigKeyValue>> {
         let state = self.state.lock()?;
         state.config.get_all(prefix)
+    }
+
+    pub(crate) fn checkpoint_location(
+        &self,
+        local: bool,
+        relation_id: &str,
+    ) -> SparkResult<String> {
+        if local {
+            self.local_checkpoint_location(relation_id)
+        } else {
+            self.configured_checkpoint_location(relation_id)
+        }
+    }
+
+    pub(crate) fn remove_local_checkpoint(&self, relation_id: &str) -> SparkResult<bool> {
+        let path = {
+            let state = self.state.lock()?;
+            state
+                .local_checkpoint_dir
+                .as_ref()
+                .map(|dir| dir.path().join(relation_id))
+        };
+        let Some(path) = path else {
+            return Ok(false);
+        };
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub(crate) fn add_executor(&self, executor: Executor) -> SparkResult<()> {
@@ -288,12 +322,50 @@ impl SparkSession {
         state.streaming_queries.reset_stopped_queries();
         Ok(())
     }
+
+    fn get_config_option_value(&self, key: &str) -> SparkResult<Option<String>> {
+        let state = self.state.lock()?;
+        Ok(state.config.get_option(key).map(ToString::to_string))
+    }
+
+    fn configured_checkpoint_location(&self, relation_id: &str) -> SparkResult<String> {
+        let Some(root) = self.get_config_option_value(SPARK_CHECKPOINT_DIR)? else {
+            return Err(SparkError::invalid(
+                "checkpoint requires spark.checkpoint.dir to be set",
+            ));
+        };
+        if root.trim().is_empty() {
+            return Err(SparkError::invalid(
+                "checkpoint requires a non-empty spark.checkpoint.dir",
+            ));
+        }
+        Ok(join_checkpoint_path(
+            root.as_str(),
+            &[self.session_id(), relation_id],
+        ))
+    }
+
+    fn local_checkpoint_location(&self, relation_id: &str) -> SparkResult<String> {
+        let mut state = self.state.lock()?;
+        if state.local_checkpoint_dir.is_none() {
+            let dir = TempDirBuilder::new()
+                .prefix(format!("sail-{}-local-checkpoint-", self.session_id).as_str())
+                .tempdir()?;
+            state.local_checkpoint_dir = Some(dir);
+        }
+        let dir = state
+            .local_checkpoint_dir
+            .as_ref()
+            .expect("local checkpoint directory should be initialized");
+        Ok(dir.path().join(relation_id).to_string_lossy().into_owned())
+    }
 }
 
 struct SparkSessionState {
     config: SparkRuntimeConfig,
     executors: HashMap<String, Arc<Executor>>,
     streaming_queries: StreamingQueryManager,
+    local_checkpoint_dir: Option<TempDir>,
 }
 
 impl SparkSessionState {
@@ -302,6 +374,122 @@ impl SparkSessionState {
             config: SparkRuntimeConfig::new(),
             executors: HashMap::new(),
             streaming_queries: StreamingQueryManager::new(),
+            local_checkpoint_dir: None,
         }
+    }
+}
+
+fn join_checkpoint_path(base: &str, components: &[&str]) -> String {
+    if Path::new(base).is_absolute() {
+        let mut path = PathBuf::from(base);
+        for component in components {
+            path.push(component);
+        }
+        path.to_string_lossy().into_owned()
+    } else {
+        let mut path = base.trim_end_matches('/').to_string();
+        for component in components {
+            path.push('/');
+            path.push_str(component);
+        }
+        path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use super::{join_checkpoint_path, ConfigKeyValue, SparkSession, SparkSessionOptions};
+
+    fn create_session() -> SparkSession {
+        SparkSession::try_new(
+            "session-123".to_string(),
+            "user-123".to_string(),
+            SparkSessionOptions {
+                execution_heartbeat_interval: Duration::from_secs(1),
+            },
+        )
+        .expect("spark session should be created")
+    }
+
+    #[test]
+    fn test_join_checkpoint_path_keeps_absolute_paths_native() {
+        let base = std::env::temp_dir().join("checkpoints");
+        let expected = base.join("session").join("relation");
+        let actual =
+            join_checkpoint_path(base.to_string_lossy().as_ref(), &["session", "relation"]);
+        assert_eq!(PathBuf::from(actual), expected);
+    }
+
+    #[test]
+    fn test_join_checkpoint_path_keeps_urls_hierarchical() {
+        let actual = join_checkpoint_path("s3://bucket/checkpoints/", &["session", "relation"]);
+        assert_eq!(actual, "s3://bucket/checkpoints/session/relation");
+    }
+
+    #[test]
+    fn test_local_checkpoint_location_reuses_session_temp_root() {
+        let session = create_session();
+        let first = session
+            .checkpoint_location(true, "relation-a")
+            .expect("local checkpoint location should resolve");
+        let second = session
+            .checkpoint_location(true, "relation-b")
+            .expect("local checkpoint location should resolve");
+        let first_parent = PathBuf::from(&first)
+            .parent()
+            .expect("first checkpoint should have a parent directory")
+            .to_path_buf();
+        let second_parent = PathBuf::from(&second)
+            .parent()
+            .expect("second checkpoint should have a parent directory")
+            .to_path_buf();
+        assert_eq!(first_parent, second_parent);
+    }
+
+    #[test]
+    fn test_remove_local_checkpoint_deletes_relation_directory() {
+        let session = create_session();
+        let location = session
+            .checkpoint_location(true, "relation-a")
+            .expect("local checkpoint location should resolve");
+        let path = PathBuf::from(location);
+        std::fs::create_dir_all(&path).expect("relation directory should be created");
+        std::fs::write(path.join("part-0"), b"data").expect("marker file should be written");
+
+        assert!(session
+            .remove_local_checkpoint("relation-a")
+            .expect("removal should succeed"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_checkpoint_location_requires_configured_checkpoint_dir() {
+        let session = create_session();
+        let error = session
+            .checkpoint_location(false, "relation-a")
+            .expect_err("checkpoint should require spark.checkpoint.dir");
+        assert!(
+            error.to_string().contains("spark.checkpoint.dir"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_location_uses_configured_checkpoint_dir() {
+        let session = create_session();
+        session
+            .set_config(vec![ConfigKeyValue {
+                key: "spark.checkpoint.dir".to_string(),
+                value: Some("file:///tmp/checkpoints".to_string()),
+            }])
+            .expect("checkpoint directory should be configured");
+
+        let location = session
+            .checkpoint_location(false, "relation-a")
+            .expect("checkpoint location should resolve");
+        assert_eq!(location, "file:///tmp/checkpoints/session-123/relation-a");
     }
 }
