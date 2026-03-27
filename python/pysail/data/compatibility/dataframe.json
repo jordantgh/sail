@@ -24,7 +24,7 @@
     "module": "pyspark.sql.DataFrame",
     "function": "checkpoint",
     "status": "partially supported",
-    "note": "Eager checkpoints materialize data in session memory. Lazy checkpoints currently keep a deferred server-side relation handle and re-execute the stored plan when queried."
+    "note": "Eager checkpoints materialize data in session memory and are not durable in the Spark sense. Deferred checkpoints are not materialized/cached today; they store a resolved server-side plan handle and later queries may re-execute that plan."
   },
   {
     "module": "pyspark.sql.DataFrame",
@@ -254,7 +254,7 @@
     "module": "pyspark.sql.DataFrame",
     "function": "localCheckpoint",
     "status": "partially supported",
-    "note": "Eager local checkpoints materialize data in session memory. Lazy local checkpoints currently keep a deferred server-side relation handle and re-execute the stored plan when queried. storageLevel is ignored."
+    "note": "Eager local checkpoints materialize data in session memory. Deferred local checkpoints are not materialized/cached today; they store a resolved server-side plan handle and later queries may re-execute that plan. storageLevel is ignored."
   },
   {
     "module": "pyspark.sql.DataFrame",
