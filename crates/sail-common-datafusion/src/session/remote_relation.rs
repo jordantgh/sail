@@ -8,26 +8,26 @@ use datafusion_expr::LogicalPlan;
 use crate::extension::SessionExtension;
 
 #[derive(Clone)]
-pub enum CheckpointEntry {
+pub enum RemoteRelationEntry {
     Materialized(Arc<dyn TableProvider>),
-    Plan {
+    Deferred {
         plan: LogicalPlan,
         fields: Vec<String>,
     },
 }
 
-/// Session-scoped storage for server-side cached relations such as Spark Connect checkpoints.
-pub struct CheckpointStore {
-    relations: Mutex<HashMap<String, CheckpointEntry>>,
+/// Session-scoped storage for server-side relations referenced by Spark Connect handles.
+pub struct RemoteRelationStore {
+    relations: Mutex<HashMap<String, RemoteRelationEntry>>,
 }
 
-impl Default for CheckpointStore {
+impl Default for RemoteRelationStore {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl CheckpointStore {
+impl RemoteRelationStore {
     pub fn new() -> Self {
         Self {
             relations: Mutex::new(HashMap::new()),
@@ -37,8 +37,8 @@ impl CheckpointStore {
     pub fn insert(
         &self,
         relation_id: String,
-        relation: CheckpointEntry,
-    ) -> datafusion_common::Result<Option<CheckpointEntry>> {
+        relation: RemoteRelationEntry,
+    ) -> datafusion_common::Result<Option<RemoteRelationEntry>> {
         let mut relations = self
             .relations
             .lock()
@@ -46,7 +46,7 @@ impl CheckpointStore {
         Ok(relations.insert(relation_id, relation))
     }
 
-    pub fn get(&self, relation_id: &str) -> datafusion_common::Result<Option<CheckpointEntry>> {
+    pub fn get(&self, relation_id: &str) -> datafusion_common::Result<Option<RemoteRelationEntry>> {
         let relations = self
             .relations
             .lock()
@@ -54,7 +54,10 @@ impl CheckpointStore {
         Ok(relations.get(relation_id).cloned())
     }
 
-    pub fn remove(&self, relation_id: &str) -> datafusion_common::Result<Option<CheckpointEntry>> {
+    pub fn remove(
+        &self,
+        relation_id: &str,
+    ) -> datafusion_common::Result<Option<RemoteRelationEntry>> {
         let mut relations = self
             .relations
             .lock()
@@ -63,8 +66,8 @@ impl CheckpointStore {
     }
 }
 
-impl SessionExtension for CheckpointStore {
+impl SessionExtension for RemoteRelationStore {
     fn name() -> &'static str {
-        "CheckpointStore"
+        "RemoteRelationStore"
     }
 }

@@ -12,8 +12,8 @@ use futures::stream;
 use log::{debug, warn};
 use sail_common::spec;
 use sail_common_datafusion::extension::SessionExtensionAccessor;
-use sail_common_datafusion::session::checkpoint::{CheckpointEntry, CheckpointStore};
 use sail_common_datafusion::session::job::JobService;
+use sail_common_datafusion::session::remote_relation::{RemoteRelationEntry, RemoteRelationStore};
 use sail_plan::{resolve_and_execute_plan, resolve_named_plan};
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use tonic::codegen::tokio_stream::Stream;
@@ -524,7 +524,7 @@ pub(crate) async fn handle_execute_checkpoint_command(
 ) -> SparkResult<ExecutePlanResponseStream> {
     let spark = ctx.extension::<SparkSession>()?;
     let service = ctx.extension::<JobService>()?;
-    let store = ctx.extension::<CheckpointStore>()?;
+    let store = ctx.extension::<RemoteRelationStore>()?;
     let CheckpointCommand {
         relation,
         local: _,
@@ -550,14 +550,14 @@ pub(crate) async fn handle_execute_checkpoint_command(
         let schema = stream.schema();
         let batches = read_stream(stream).await?;
         let relation: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema, vec![batches])?);
-        CheckpointEntry::Materialized(relation)
+        RemoteRelationEntry::Materialized(relation)
     } else {
         let sail_plan::resolver::plan::NamedPlan { plan, fields } =
             resolve_named_plan(ctx, spark.plan_config()?, plan).await?;
         let fields = fields.ok_or_else(|| {
             SparkError::invalid("checkpoint relation must resolve to a query plan")
         })?;
-        CheckpointEntry::Plan { plan, fields }
+        RemoteRelationEntry::Deferred { plan, fields }
     };
     let _ = store.insert(relation_id.clone(), relation)?;
 
@@ -583,7 +583,7 @@ pub(crate) async fn handle_execute_remove_cached_remote_relation_command(
     metadata: ExecutorMetadata,
 ) -> SparkResult<ExecutePlanResponseStream> {
     let spark = ctx.extension::<SparkSession>()?;
-    let store = ctx.extension::<CheckpointStore>()?;
+    let store = ctx.extension::<RemoteRelationStore>()?;
     let relation = command.relation.required("cached remote relation")?;
     let _ = store.remove(&relation.relation_id)?;
     let mut output = vec![];
