@@ -73,11 +73,13 @@ def test_dataframe_drop(spark):
 
 
 @pytest.mark.parametrize("method_name", ["checkpoint", "localCheckpoint"])
-def test_checkpoint_materializes_temp_view_input(spark, method_name):
+def test_checkpoint_materializes_temp_view_input(spark, method_name, tmp_path):
     source = spark.createDataFrame([(1, "alpha"), (2, "beta"), (3, "gamma")], ["id", "value"])
     source.createOrReplaceTempView("checkpoint_source")
 
     df = spark.table("checkpoint_source").where(col("id") >= 2)
+    if method_name == "checkpoint":
+        spark.conf.set("spark.checkpoint.dir", (tmp_path / "checkpoint-dir").as_uri())
     checkpointed = getattr(df, method_name)()
 
     spark.catalog.dropTempView("checkpoint_source")
