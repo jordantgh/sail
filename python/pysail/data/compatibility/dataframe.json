@@ -254,7 +254,7 @@
     "module": "pyspark.sql.DataFrame",
     "function": "localCheckpoint",
     "status": "partially supported",
-    "note": "Requires a PySpark 4+ Spark Connect client. Supported only in local execution mode. Eager local checkpoints use session-local parquet files on the server without requiring spark.checkpoint.dir, and storageLevel is not supported yet."
+    "note": "Requires a PySpark 4+ Spark Connect client. Supported only in local execution mode. Uses a session-local checkpoint store backed by memory and optional temporary Arrow files, supports eager and lazy materialization, and honors local storage levels that keep replication=1 and off-heap storage disabled."
   },
   {
     "module": "pyspark.sql.DataFrame",
@@ -421,8 +421,8 @@
   {
     "module": "pyspark.sql.DataFrame",
     "function": "storageLevel",
-    "status": "planned",
-    "ref": "https://github.com/lakehq/sail/issues/484"
+    "status": "partially supported",
+    "note": "Returns the configured storage level for localCheckpointed Spark Connect DataFrames in local execution mode. Other DataFrame cache and persist workflows are still not implemented."
   },
   {
     "module": "pyspark.sql.DataFrame",
