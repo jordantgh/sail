@@ -311,13 +311,14 @@ mod tests {
     #[test]
     fn test_build_checkpoint_write_plan_uses_parquet_file_write_node() {
         let plan = LogicalPlanBuilder::empty(false).build().unwrap();
+        let schema = plan.schema().as_arrow();
         let backing = RemoteRelationBacking::Files {
             location: "file:///tmp/checkpoints/relation-a".to_string(),
             format: "parquet".to_string(),
             cleanup_policy: RemoteRelationCleanupPolicy::RetainOnRemove,
         };
 
-        let checkpoint = build_checkpoint_write_plan(plan, &backing).unwrap();
+        let checkpoint = build_checkpoint_write_plan(plan, schema.as_ref(), &backing).unwrap();
         let LogicalPlan::Extension(extension) = checkpoint else {
             panic!("checkpoint write plan should be a logical extension node");
         };
