@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn test_build_checkpoint_write_plan_uses_parquet_file_write_node() {
         let plan = LogicalPlanBuilder::empty(false).build().unwrap();
-        let schema = plan.schema().as_arrow();
+        let schema = plan.schema().as_arrow().clone();
         let backing = RemoteRelationBacking::Files {
             location: "file:///tmp/checkpoints/relation-a".to_string(),
             format: "parquet".to_string(),
