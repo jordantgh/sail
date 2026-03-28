@@ -6,13 +6,14 @@ use tonic::{Request, Response, Status};
 use crate::driver::actor::DriverActor;
 use crate::driver::gen::driver_service_server::DriverService;
 use crate::driver::gen::{
-    RegisterWorkerRequest, RegisterWorkerResponse, ReportTaskStatusRequest,
-    ReportTaskStatusResponse, ReportWorkerHeartbeatRequest, ReportWorkerHeartbeatResponse,
-    ReportWorkerKnownPeersRequest, ReportWorkerKnownPeersResponse,
+    RegisterWorkerRequest, RegisterWorkerResponse, ReportLocalCheckpointPartitionRequest,
+    ReportLocalCheckpointPartitionResponse, ReportTaskStatusRequest, ReportTaskStatusResponse,
+    ReportWorkerHeartbeatRequest, ReportWorkerHeartbeatResponse, ReportWorkerKnownPeersRequest,
+    ReportWorkerKnownPeersResponse,
 };
-use crate::driver::{gen, DriverEvent};
+use crate::driver::{gen, DriverEvent, LocalCheckpointStreamOwner};
 use crate::error::ExecutionError;
-use crate::id::{TaskKey, WorkerId};
+use crate::id::{JobId, TaskKey, TaskStreamKey, WorkerId};
 
 pub struct DriverServer {
     handle: ActorHandle<DriverActor>,
@@ -137,6 +138,41 @@ impl DriverService for DriverServer {
             .await
             .map_err(ExecutionError::from)?;
         let response = ReportTaskStatusResponse {};
+        debug!("{response:?}");
+        Ok(Response::new(response))
+    }
+
+    async fn report_local_checkpoint_partition(
+        &self,
+        request: Request<ReportLocalCheckpointPartitionRequest>,
+    ) -> Result<Response<ReportLocalCheckpointPartitionResponse>, Status> {
+        let request = request.into_inner();
+        debug!("{request:?}");
+        let ReportLocalCheckpointPartitionRequest {
+            checkpoint_job_id,
+            partition,
+            attempt,
+            channel,
+            worker_id,
+        } = request;
+        let event = DriverEvent::RegisterLocalCheckpointPartition {
+            checkpoint_job_id: JobId::from(checkpoint_job_id),
+            key: TaskStreamKey {
+                job_id: JobId::from(checkpoint_job_id),
+                stage: 0,
+                partition: partition as usize,
+                attempt: attempt as usize,
+                channel: channel as usize,
+            },
+            owner: LocalCheckpointStreamOwner::Worker {
+                worker_id: WorkerId::from(worker_id),
+            },
+        };
+        self.handle
+            .send(event)
+            .await
+            .map_err(ExecutionError::from)?;
+        let response = ReportLocalCheckpointPartitionResponse {};
         debug!("{response:?}");
         Ok(Response::new(response))
     }

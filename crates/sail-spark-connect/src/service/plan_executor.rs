@@ -600,12 +600,6 @@ pub(crate) async fn handle_execute_checkpoint_command(
         storage_level,
     } = checkpoint;
 
-    if local && service.runner().mode() != JobRunnerMode::Local {
-        return Err(SparkError::unsupported(
-            "localCheckpoint is only supported in local execution mode",
-        ));
-    }
-
     let relation = relation.required("checkpoint relation")?;
     let plan: spec::Plan = relation.try_into()?;
     let query = match plan {
@@ -618,6 +612,7 @@ pub(crate) async fn handle_execute_checkpoint_command(
     };
     let relation_id = uuid::Uuid::new_v4().to_string();
     let storage_id = uuid::Uuid::new_v4().to_string();
+    let runner_mode = service.runner().mode();
     let plan_config = spark.plan_config()?;
     let sail_plan::resolver::plan::NamedPlan { plan, fields } =
         resolve_named_plan(ctx, plan_config, spec::Plan::Query(query)).await?;
@@ -630,11 +625,13 @@ pub(crate) async fn handle_execute_checkpoint_command(
             .map_err(SparkError::unsupported)?;
         RemoteRelationBacking::LocalCache {
             storage_level: storage_level.clone(),
-            location: storage_level
-                .use_disk
+            location: (runner_mode == JobRunnerMode::Local && storage_level.use_disk)
                 .then(|| spark.checkpoint_location(true, &storage_id))
                 .transpose()?,
-            format: storage_level.use_disk.then(|| "arrow".to_string()),
+            format: (runner_mode == JobRunnerMode::Local && storage_level.use_disk)
+                .then(|| "arrow".to_string()),
+            stream_job_id: (runner_mode == JobRunnerMode::Cluster)
+                .then_some(generate_local_checkpoint_job_id()),
             cleanup_policy: RemoteRelationCleanupPolicy::DeleteOnRemove,
         }
     } else {
@@ -676,6 +673,12 @@ pub(crate) async fn handle_execute_checkpoint_command(
         metadata.operation_id,
         Box::pin(stream::iter(output)),
     ))
+}
+
+fn generate_local_checkpoint_job_id() -> u64 {
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&uuid::Uuid::new_v4().into_bytes()[..8]);
+    u64::from_le_bytes(bytes) | (1_u64 << 63)
 }
 
 pub(crate) async fn handle_execute_remove_cached_remote_relation_command(
