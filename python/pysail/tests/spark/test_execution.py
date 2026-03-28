@@ -267,9 +267,7 @@ class TestLocalClusterExecution:
         source = spark.createDataFrame([(1, "alpha"), (2, "beta"), (3, "gamma")], ["id", "value"])
         source.createOrReplaceTempView("cluster_lazy_local_checkpoint_source")
 
-        df = spark.table("cluster_lazy_local_checkpoint_source").where(
-            F.col("id") >= CHECKPOINT_MIN_ID
-        )
+        df = spark.table("cluster_lazy_local_checkpoint_source").where(F.col("id") >= CHECKPOINT_MIN_ID)
         checkpointed = df.localCheckpoint(False, storageLevel=StorageLevel.DISK_ONLY)
 
         expected = pd.DataFrame({"id": [2, 3], "value": ["beta", "gamma"]})
