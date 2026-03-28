@@ -15,6 +15,7 @@ CHECKPOINT_CONNECT_SUPPORTED = pytest.mark.skipif(
     pyspark_version() < (4,),
     reason="Spark Connect checkpoint APIs require Spark 4+",
 )
+CHECKPOINT_MIN_ID = 2
 
 
 @pytest.fixture(scope="session")
@@ -246,7 +247,7 @@ class TestLocalClusterExecution:
         source = spark.createDataFrame([(1, "alpha"), (2, "beta"), (3, "gamma")], ["id", "value"])
         source.createOrReplaceTempView("cluster_local_checkpoint_source")
 
-        df = spark.table("cluster_local_checkpoint_source").where(F.col("id") >= 2)
+        df = spark.table("cluster_local_checkpoint_source").where(F.col("id") >= CHECKPOINT_MIN_ID)
         checkpointed = df.localCheckpoint(storageLevel=StorageLevel.MEMORY_ONLY)
 
         spark.catalog.dropTempView("cluster_local_checkpoint_source")
@@ -266,7 +267,9 @@ class TestLocalClusterExecution:
         source = spark.createDataFrame([(1, "alpha"), (2, "beta"), (3, "gamma")], ["id", "value"])
         source.createOrReplaceTempView("cluster_lazy_local_checkpoint_source")
 
-        df = spark.table("cluster_lazy_local_checkpoint_source").where(F.col("id") >= 2)
+        df = spark.table("cluster_lazy_local_checkpoint_source").where(
+            F.col("id") >= CHECKPOINT_MIN_ID
+        )
         checkpointed = df.localCheckpoint(False, storageLevel=StorageLevel.DISK_ONLY)
 
         expected = pd.DataFrame({"id": [2, 3], "value": ["beta", "gamma"]})
