@@ -179,6 +179,7 @@ def test_local_checkpoint_materializes_temp_view_input(spark):
 
     spark.catalog.dropTempView("local_checkpoint_source")
 
+    assert checkpointed.storageLevel == StorageLevel.MEMORY_AND_DISK
     assert_frame_equal(
         checkpointed.orderBy("id").toPandas(),
         pd.DataFrame({"id": [2, 3], "value": ["beta", "gamma"]}),
@@ -190,8 +191,62 @@ def test_local_checkpoint_materializes_temp_view_input(spark):
 
 
 @CHECKPOINT_CONNECT_SUPPORTED
-def test_local_checkpoint_rejects_storage_level(spark):
+def test_local_checkpoint_lazy_materializes_once_and_survives_source_drop(spark):
+    source = spark.createDataFrame([(1, "alpha"), (2, "beta"), (3, "gamma")], ["id", "value"])
+    source.createOrReplaceTempView("lazy_local_checkpoint_source")
+
+    df = spark.table("lazy_local_checkpoint_source").where(col("id") >= CHECKPOINT_MIN_ID)
+    checkpointed = df.localCheckpoint(False, storageLevel=StorageLevel.MEMORY_ONLY)
+
+    expected = pd.DataFrame({"id": [2, 3], "value": ["beta", "gamma"]})
+
+    assert checkpointed.storageLevel == StorageLevel.MEMORY_ONLY
+    assert repr(checkpointed) == "DataFrame[id: bigint, value: string]"
+    assert_frame_equal(
+        checkpointed.orderBy("id").toPandas(),
+        expected,
+        check_dtype=False,
+    )
+
+    spark.catalog.dropTempView("lazy_local_checkpoint_source")
+
+    assert_frame_equal(
+        checkpointed.orderBy("id").toPandas(),
+        expected,
+        check_dtype=False,
+    )
+
+    with pytest.raises(Exception, match=r"TABLE_OR_VIEW_NOT_FOUND|not found|unknown"):
+        df.collect()
+
+
+@CHECKPOINT_CONNECT_SUPPORTED
+def test_local_checkpoint_honors_disk_only_storage_level(spark):
+    source = spark.createDataFrame([(1, "alpha"), (2, "beta"), (3, "gamma")], ["id", "value"])
+    source.createOrReplaceTempView("disk_local_checkpoint_source")
+
+    df = spark.table("disk_local_checkpoint_source").where(col("id") >= CHECKPOINT_MIN_ID)
+    checkpointed = df.localCheckpoint(storageLevel=StorageLevel.DISK_ONLY)
+
+    spark.catalog.dropTempView("disk_local_checkpoint_source")
+
+    assert checkpointed.storageLevel == StorageLevel.DISK_ONLY
+    assert_frame_equal(
+        checkpointed.orderBy("id").toPandas(),
+        pd.DataFrame({"id": [2, 3], "value": ["beta", "gamma"]}),
+        check_dtype=False,
+    )
+
+    with pytest.raises(Exception, match=r"TABLE_OR_VIEW_NOT_FOUND|not found|unknown"):
+        df.collect()
+
+
+@CHECKPOINT_CONNECT_SUPPORTED
+def test_local_checkpoint_rejects_unsupported_storage_levels(spark):
     df = spark.createDataFrame([(1, "alpha")], ["id", "value"])
 
-    with pytest.raises(Exception, match=r"storageLevel"):
-        df.localCheckpoint(storageLevel=StorageLevel.MEMORY_ONLY)
+    with pytest.raises(Exception, match=r"replication"):
+        df.localCheckpoint(storageLevel=StorageLevel.MEMORY_ONLY_2)
+
+    with pytest.raises(Exception, match=r"offHeap|OffHeap"):
+        df.localCheckpoint(storageLevel=StorageLevel.OFF_HEAP)
