@@ -142,7 +142,7 @@ jobs:
 
   codecov-notify:
     name: Codecov Notify
-    if: ${{ !cancelled() && github.actor != 'dependabot[bot]' }}
+    if: ${{ !cancelled() && github.actor != 'dependabot[bot]' && github.repository == 'lakehq/sail' }}
     runs-on: ubuntu-slim
     needs:
       - rust-tests
