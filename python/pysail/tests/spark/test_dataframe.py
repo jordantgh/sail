@@ -4,6 +4,8 @@ from pandas.testing import assert_frame_equal
 from pyspark.sql import Row
 from pyspark.sql.functions import col, lit
 
+CHECKPOINT_MIN_ID = 2
+
 
 @pytest.fixture
 def checkpoint_dir(spark, tmp_path):
@@ -98,7 +100,7 @@ def test_checkpoint_requires_checkpoint_dir(spark):
         spark.conf.unset(key)
     try:
         df = spark.createDataFrame([(1, "alpha")], ["id", "value"])
-        with pytest.raises(Exception, match="spark.checkpoint.dir"):
+        with pytest.raises(Exception, match=r"spark\.checkpoint\.dir"):
             df.checkpoint()
     finally:
         if previous is not None:
@@ -109,7 +111,7 @@ def test_checkpoint_materializes_temp_view_input(spark, checkpoint_dir):
     source = spark.createDataFrame([(1, "alpha"), (2, "beta"), (3, "gamma")], ["id", "value"])
     source.createOrReplaceTempView("checkpoint_source")
 
-    df = spark.table("checkpoint_source").where(col("id") >= 2)
+    df = spark.table("checkpoint_source").where(col("id") >= CHECKPOINT_MIN_ID)
     checkpointed = df.checkpoint()
 
     spark.catalog.dropTempView("checkpoint_source")
@@ -128,7 +130,7 @@ def test_checkpoint_lazy_materializes_once_and_survives_source_drop(spark, check
     source = spark.createDataFrame([(1, "alpha"), (2, "beta"), (3, "gamma")], ["id", "value"])
     source.createOrReplaceTempView("lazy_checkpoint_source")
 
-    df = spark.table("lazy_checkpoint_source").where(col("id") >= 2)
+    df = spark.table("lazy_checkpoint_source").where(col("id") >= CHECKPOINT_MIN_ID)
     checkpointed = df.checkpoint(False)
 
     expected = pd.DataFrame({"id": [2, 3], "value": ["beta", "gamma"]}).astype({"id": "int64"})
