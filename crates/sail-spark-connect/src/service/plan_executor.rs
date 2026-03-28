@@ -2,20 +2,30 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use async_trait::async_trait;
 use datafusion::arrow::compute::concat_batches;
+use datafusion::catalog::Session;
+use datafusion::common::{DataFusionError, Result as DataFusionResult};
+use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::datasource::TableProvider;
+use datafusion::logical_expr::{Extension, LogicalPlan};
 use datafusion::prelude::SessionContext;
 use fastrace::collector::SpanContext;
 use fastrace::future::FutureExt;
 use fastrace::Span;
-use futures::stream;
+use futures::{stream, StreamExt, TryStreamExt};
 use log::{debug, warn};
 use sail_common::spec;
-use sail_common_datafusion::datasource::{SourceInfo, TableFormatRegistry};
+use sail_common_datafusion::datasource::{SinkMode, SourceInfo, TableFormatRegistry};
 use sail_common_datafusion::extension::SessionExtensionAccessor;
+use sail_common_datafusion::rename::logical_plan::rename_logical_plan;
 use sail_common_datafusion::rename::schema::rename_schema;
-use sail_common_datafusion::session::job::JobService;
-use sail_common_datafusion::session::remote_relation::{RemoteRelationEntry, RemoteRelationStore};
+use sail_common_datafusion::session::job::{JobRunnerMode, JobService};
+use sail_common_datafusion::session::remote_relation::{
+    CheckpointRelation, RemoteRelationBacking, RemoteRelationCleanupPolicy,
+    RemoteRelationMaterializer, RemoteRelationStore,
+};
+use sail_logical_plan::file_write::{FileWriteNode, FileWriteOptions};
 use sail_plan::{resolve_and_execute_plan, resolve_named_plan};
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use tonic::codegen::tokio_stream::Stream;
@@ -133,9 +143,14 @@ async fn handle_execute_plan(
     let service = ctx.extension::<JobService>()?;
     let operation_id = metadata.operation_id.clone();
     let (plan, _) = resolve_and_execute_plan(ctx, spark.plan_config()?, plan).await?;
+    let session_state = ctx.state();
     let stream = {
         let span = Span::enter_with_parent("JobRunner::execute", &span);
-        service.runner().execute(ctx, plan).in_span(span).await?
+        service
+            .runner()
+            .execute(&session_state, plan)
+            .in_span(span)
+            .await?
     };
     let rx = match mode {
         ExecutePlanMode::Lazy => {
@@ -254,7 +269,8 @@ pub(crate) async fn handle_execute_sql_command(
         spec::Plan::Query(_) => relation,
         command @ spec::Plan::Command(_) => {
             let (plan, _) = resolve_and_execute_plan(ctx, spark.plan_config()?, command).await?;
-            let stream = service.runner().execute(ctx, plan).await?;
+            let session_state = ctx.state();
+            let stream = service.runner().execute(&session_state, plan).await?;
             let schema = stream.schema();
             let data = read_stream(stream).await?;
             let data = concat_batches(&schema, data.iter())?;
@@ -283,49 +299,49 @@ pub(crate) async fn handle_execute_sql_command(
 
 #[cfg(test)]
 mod tests {
-    use sail_common::spec;
+    use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
+    use sail_common_datafusion::datasource::SinkMode;
+    use sail_common_datafusion::session::remote_relation::{
+        RemoteRelationBacking, RemoteRelationCleanupPolicy,
+    };
+    use sail_logical_plan::file_write::FileWriteNode;
 
     use super::build_checkpoint_write_plan;
 
     #[test]
-    fn test_build_checkpoint_write_plan_uses_parquet_directory_write() {
-        let plan = spec::QueryPlan::new(spec::QueryNode::Range(spec::Range {
-            start: Some(0),
-            end: 3,
-            step: 1,
-            num_partitions: Some(2),
-        }));
-        let checkpoint_location = std::env::temp_dir()
-            .join("checkpoint")
-            .to_string_lossy()
-            .into_owned();
-
-        let checkpoint = build_checkpoint_write_plan(plan, true, checkpoint_location.clone());
-        let spec::Plan::Command(command) = checkpoint else {
-            panic!("checkpoint write plan should be a command");
-        };
-        let spec::CommandNode::InsertOverwriteDirectory {
-            local,
-            location,
-            file_format,
-            row_format,
-            options,
-            ..
-        } = command.node
-        else {
-            panic!("checkpoint should lower to INSERT OVERWRITE DIRECTORY");
+    fn test_build_checkpoint_write_plan_uses_parquet_file_write_node() {
+        let plan = LogicalPlanBuilder::empty(false).build().unwrap();
+        let schema = plan.schema().as_arrow().clone();
+        let backing = RemoteRelationBacking::Files {
+            location: "file:///tmp/checkpoints/relation-a".to_string(),
+            format: "parquet".to_string(),
+            cleanup_policy: RemoteRelationCleanupPolicy::RetainOnRemove,
         };
 
-        assert!(local);
-        assert_eq!(location.as_deref(), Some(checkpoint_location.as_str()));
+        let checkpoint = build_checkpoint_write_plan(plan, schema.as_ref(), &backing).unwrap();
+        let LogicalPlan::Extension(extension) = checkpoint else {
+            panic!("checkpoint write plan should be a logical extension node");
+        };
+        let node = extension
+            .node
+            .as_any()
+            .downcast_ref::<FileWriteNode>()
+            .expect("checkpoint write plan should use FileWriteNode");
+        let options = node.options();
+
+        assert_eq!(options.format, "parquet");
+        assert_eq!(options.mode, SinkMode::Overwrite);
+        assert!(options.partition_by.is_empty());
+        assert!(options.sort_by.is_empty());
+        assert!(options.bucket_by.is_none());
+        assert!(options.table_properties.is_empty());
         assert_eq!(
-            file_format,
-            Some(spec::TableFileFormat::General {
-                format: "parquet".to_string(),
-            })
+            options.options,
+            vec![vec![(
+                "path".to_string(),
+                "file:///tmp/checkpoints/relation-a".to_string(),
+            )]]
         );
-        assert!(row_format.is_none());
-        assert!(options.is_empty());
     }
 }
 
@@ -341,7 +357,8 @@ pub(crate) async fn handle_execute_write_stream_operation_start(
     let query_name = start.query_name.clone();
     let plan = spec::Plan::Command(spec::CommandPlan::new(start.try_into()?));
     let (plan, info) = resolve_and_execute_plan(ctx, spark.plan_config()?, plan).await?;
-    let stream = service.runner().execute(ctx, plan).await?;
+    let session_state = ctx.state();
+    let stream = service.runner().execute(&session_state, plan).await?;
     let id = spark.start_streaming_query(query_name.clone(), info, stream)?;
     let result = WriteStreamOperationStartResult {
         query_id: Some(id.into()),
@@ -579,10 +596,20 @@ pub(crate) async fn handle_execute_checkpoint_command(
         relation,
         local,
         eager,
-        storage_level: _,
+        storage_level,
     } = checkpoint;
 
-    // Sail currently serves both checkpoint variants from the same session-scoped cache.
+    if local && service.runner().mode() != JobRunnerMode::Local {
+        return Err(SparkError::unsupported(
+            "localCheckpoint is only supported in local execution mode",
+        ));
+    }
+    if local && storage_level.is_some() {
+        return Err(SparkError::unsupported(
+            "localCheckpoint(storageLevel=...) is not supported yet",
+        ));
+    }
+
     let relation = relation.required("checkpoint relation")?;
     let plan: spec::Plan = relation.try_into()?;
     let query = match plan {
@@ -594,27 +621,34 @@ pub(crate) async fn handle_execute_checkpoint_command(
         }
     };
     let relation_id = uuid::Uuid::new_v4().to_string();
+    let storage_id = uuid::Uuid::new_v4().to_string();
     let plan_config = spark.plan_config()?;
-    let relation = if eager {
-        let location = spark.checkpoint_location(local, &relation_id)?;
-        let relation = materialize_checkpoint_relation(
-            ctx,
-            service,
-            plan_config.clone(),
-            query,
-            local,
-            location,
-        )
-        .await?;
-        RemoteRelationEntry::Materialized(relation)
-    } else {
-        let sail_plan::resolver::plan::NamedPlan { plan, fields } =
-            resolve_named_plan(ctx, plan_config, spec::Plan::Query(query)).await?;
-        let fields = fields.ok_or_else(|| {
-            SparkError::invalid("checkpoint relation must resolve to a query plan")
-        })?;
-        RemoteRelationEntry::Deferred { plan, fields }
+    let sail_plan::resolver::plan::NamedPlan { plan, fields } =
+        resolve_named_plan(ctx, plan_config, spec::Plan::Query(query)).await?;
+    let fields = fields
+        .ok_or_else(|| SparkError::invalid("checkpoint relation must resolve to a query plan"))?;
+    let schema = rename_schema(plan.schema().as_arrow(), &fields)?;
+    let location = spark.checkpoint_location(local, &storage_id)?;
+    let backing = RemoteRelationBacking::Files {
+        location,
+        format: "parquet".to_string(),
+        cleanup_policy: if local {
+            RemoteRelationCleanupPolicy::DeleteOnRemove
+        } else {
+            RemoteRelationCleanupPolicy::RetainOnRemove
+        },
     };
+    let relation = Arc::new(CheckpointRelation::new(
+        relation_id.clone(),
+        schema,
+        plan,
+        backing,
+        Arc::new(SparkCheckpointMaterializer),
+    ));
+    if eager {
+        let session_state = ctx.state();
+        let _ = relation.ensure_materialized(&session_state).await?;
+    }
     let _ = store.insert(relation_id.clone(), relation)?;
 
     let result = CheckpointCommandResult {
@@ -641,8 +675,10 @@ pub(crate) async fn handle_execute_remove_cached_remote_relation_command(
     let spark = ctx.extension::<SparkSession>()?;
     let store = ctx.extension::<RemoteRelationStore>()?;
     let relation = command.relation.required("cached remote relation")?;
-    let _ = store.remove(&relation.relation_id)?;
-    let _ = spark.remove_local_checkpoint(&relation.relation_id)?;
+    if let Some(entry) = store.remove(&relation.relation_id)? {
+        let session_state = ctx.state();
+        entry.remove(&session_state).await?;
+    }
     let mut output = vec![];
     if metadata.reattachable {
         output.push(ExecutorOutput::complete());
@@ -654,42 +690,78 @@ pub(crate) async fn handle_execute_remove_cached_remote_relation_command(
     ))
 }
 
-async fn materialize_checkpoint_relation(
-    ctx: &SessionContext,
-    service: &JobService,
-    plan_config: Arc<sail_plan::config::PlanConfig>,
-    query: spec::QueryPlan,
-    local: bool,
-    location: String,
-) -> SparkResult<Arc<dyn TableProvider>> {
-    let sail_plan::resolver::plan::NamedPlan {
-        plan: logical_plan,
-        fields,
-    } = resolve_named_plan(ctx, plan_config.clone(), spec::Plan::Query(query.clone())).await?;
-    let fields = fields
-        .ok_or_else(|| SparkError::invalid("checkpoint relation must resolve to a query plan"))?;
-    let schema = rename_schema(logical_plan.schema().as_arrow(), &fields)?;
-    // Reuse Sail's normal distributed file-write path so eager checkpoints do not
-    // centralize all data on the driver before they become a reusable relation.
-    let write = build_checkpoint_write_plan(query, local, location.clone());
-    let (write, _) = resolve_and_execute_plan(ctx, plan_config, write).await?;
-    let stream = service.runner().execute(ctx, write).await?;
-    let _ = read_stream(stream).await?;
-    build_checkpoint_provider(ctx, location, schema.as_ref().clone()).await
+#[derive(Debug)]
+struct SparkCheckpointMaterializer;
+
+#[async_trait]
+impl RemoteRelationMaterializer for SparkCheckpointMaterializer {
+    async fn materialize(
+        &self,
+        state: &dyn Session,
+        plan: &LogicalPlan,
+        schema: Arc<datafusion::arrow::datatypes::Schema>,
+        backing: &RemoteRelationBacking,
+    ) -> DataFusionResult<Arc<dyn TableProvider>> {
+        self.cleanup(state, backing).await?;
+        let write = build_checkpoint_write_plan(plan.clone(), schema.as_ref(), backing)?;
+        let physical = state.create_physical_plan(&write).await?;
+        let service = state.extension::<JobService>()?;
+        let stream = service.runner().execute(state, physical).await?;
+        let _ = read_stream(stream)
+            .await
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        build_checkpoint_provider(state, backing, schema.as_ref().clone()).await
+    }
+
+    async fn cleanup(
+        &self,
+        state: &dyn Session,
+        backing: &RemoteRelationBacking,
+    ) -> DataFusionResult<()> {
+        let RemoteRelationBacking::Files { location, .. } = backing;
+        let parsed = ListingTableUrl::parse(location)?;
+        let store = state
+            .runtime_env()
+            .object_store_registry
+            .get_store(parsed.as_ref())?;
+        let prefix = parsed.prefix().clone();
+        let to_delete = store
+            .list(Some(&prefix))
+            .map_ok(move |meta| meta.location)
+            .boxed();
+        let _ = store
+            .delete_stream(to_delete)
+            .try_collect::<Vec<_>>()
+            .await?;
+        if parsed.scheme() == "file" {
+            let url: &url::Url = parsed.as_ref();
+            if let Ok(path) = url.to_file_path() {
+                match std::fs::remove_dir_all(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 async fn build_checkpoint_provider(
-    ctx: &SessionContext,
-    location: String,
+    ctx: &dyn Session,
+    backing: &RemoteRelationBacking,
     schema: datafusion::arrow::datatypes::Schema,
-) -> SparkResult<Arc<dyn TableProvider>> {
+) -> DataFusionResult<Arc<dyn TableProvider>> {
     let registry = ctx.extension::<TableFormatRegistry>()?;
+    let RemoteRelationBacking::Files {
+        location, format, ..
+    } = backing;
     Ok(registry
-        .get("parquet")?
+        .get(format.as_str())?
         .create_provider(
-            &ctx.state(),
+            ctx,
             SourceInfo {
-                paths: vec![location],
+                paths: vec![location.clone()],
                 schema: Some(schema),
                 constraints: Default::default(),
                 partition_by: vec![],
@@ -701,19 +773,34 @@ async fn build_checkpoint_provider(
         .await?)
 }
 
-fn build_checkpoint_write_plan(plan: spec::QueryPlan, local: bool, location: String) -> spec::Plan {
-    spec::Plan::Command(spec::CommandPlan::new(
-        spec::CommandNode::InsertOverwriteDirectory {
-            input: Box::new(plan),
-            local,
-            location: Some(location),
-            file_format: Some(spec::TableFileFormat::General {
-                format: "parquet".to_string(),
-            }),
-            row_format: None,
-            options: vec![],
-        },
-    ))
+fn build_checkpoint_write_plan(
+    plan: LogicalPlan,
+    schema: &datafusion::arrow::datatypes::Schema,
+    backing: &RemoteRelationBacking,
+) -> DataFusionResult<LogicalPlan> {
+    let RemoteRelationBacking::Files {
+        location, format, ..
+    } = backing;
+    let names = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().to_string())
+        .collect::<Vec<_>>();
+    let plan = rename_logical_plan(plan, &names)?;
+    Ok(LogicalPlan::Extension(Extension {
+        node: Arc::new(FileWriteNode::new(
+            Arc::new(plan),
+            FileWriteOptions {
+                format: format.clone(),
+                mode: SinkMode::Overwrite,
+                partition_by: vec![],
+                sort_by: vec![],
+                bucket_by: None,
+                table_properties: vec![],
+                options: vec![vec![("path".to_string(), location.clone())]],
+            },
+        )),
+    }))
 }
 
 pub(crate) async fn handle_interrupt_all(ctx: &SessionContext) -> SparkResult<Vec<String>> {

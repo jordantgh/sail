@@ -1,0 +1,5 @@
+>>> # The tests are adapted from the doctests of the
+>>> # `pyspark.sql.dataframe.DataFrame.localCheckpoint()` method.
+>>> df = spark.createDataFrame([(14, "Tom"), (23, "Alice"), (16, "Bob")], ["age", "name"])
+>>> df.localCheckpoint(False)
+DataFrame[age: bigint, name: string]

@@ -23,8 +23,8 @@
   {
     "module": "pyspark.sql.DataFrame",
     "function": "checkpoint",
-    "status": "planned",
-    "ref": "https://github.com/lakehq/sail/issues/476"
+    "status": "supported",
+    "note": "Requires a PySpark 4+ Spark Connect client and spark.checkpoint.dir. checkpoint(eager=True) writes parquet files to durable storage and returns a session-scoped remote relation handle. checkpoint(eager=False) registers a deferred checkpoint that materializes once on first use and then reuses the materialized files."
   },
   {
     "module": "pyspark.sql.DataFrame",
@@ -253,8 +253,8 @@
   {
     "module": "pyspark.sql.DataFrame",
     "function": "localCheckpoint",
-    "status": "planned",
-    "ref": "https://github.com/lakehq/sail/issues/482"
+    "status": "partially supported",
+    "note": "Requires a PySpark 4+ Spark Connect client. Supported only in local execution mode. Local checkpoints use session-local parquet files on the server, and storageLevel is not supported yet."
   },
   {
     "module": "pyspark.sql.DataFrame",

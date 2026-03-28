@@ -175,6 +175,14 @@ DOCTEST_MARKERS = [
         keywords=["test_python_datasource_read_arrow.txt"],
         markers=[pytest.mark.skipif(pyspark_version() < (4,), reason="Python data source requires Spark 4+")],
     ),
+    DoctestMarker(
+        keywords=["test_checkpoint.txt"],
+        markers=[pytest.mark.skipif(pyspark_version() < (4,), reason="Spark Connect checkpoint APIs require Spark 4+")],
+    ),
+    DoctestMarker(
+        keywords=["test_local_checkpoint.txt"],
+        markers=[pytest.mark.skipif(pyspark_version() < (4,), reason="Spark Connect checkpoint APIs require Spark 4+")],
+    ),
 ]
 
 

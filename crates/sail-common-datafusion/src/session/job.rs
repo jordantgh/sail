@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use datafusion::catalog::Session;
 use datafusion::common::Result;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::SessionContext;
 use tokio::sync::oneshot;
 
 use crate::extension::SessionExtension;
@@ -13,12 +13,20 @@ use crate::system::observable::{JobRunnerObserver, StateObservable};
 use crate::system::predicate::PredicateExt;
 use crate::system::types::StageInput;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobRunnerMode {
+    Local,
+    Cluster,
+}
+
 #[tonic::async_trait]
 pub trait JobRunner: StateObservable<JobRunnerObserver> + Send + Sync + 'static {
+    fn mode(&self) -> JobRunnerMode;
+
     /// Executes a plan
     async fn execute(
         &self,
-        ctx: &SessionContext,
+        ctx: &dyn Session,
         plan: Arc<dyn ExecutionPlan>,
     ) -> Result<SendableRecordBatchStream>;
 

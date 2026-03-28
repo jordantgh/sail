@@ -9,8 +9,7 @@ use sail_common::spec;
 use sail_common_datafusion::array::record_batch::{cast_record_batch, read_record_batches};
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::literal::LiteralEvaluator;
-use sail_common_datafusion::rename::logical_plan::rename_logical_plan;
-use sail_common_datafusion::session::remote_relation::{RemoteRelationEntry, RemoteRelationStore};
+use sail_common_datafusion::session::remote_relation::RemoteRelationStore;
 use sail_logical_plan::range::RangeNode;
 
 use crate::error::{PlanError, PlanResult};
@@ -150,24 +149,14 @@ impl PlanResolver<'_> {
         let relation = store.get(&relation_id)?.ok_or_else(|| {
             PlanError::AnalysisError(format!("cached relation not found: {relation_id}"))
         })?;
-        match relation {
-            RemoteRelationEntry::Materialized(table_provider) => self
-                .resolve_table_provider_with_rename(
-                    table_provider,
-                    UNNAMED_TABLE,
-                    None,
-                    vec![],
-                    None,
-                    state,
-                ),
-            RemoteRelationEntry::Deferred { plan, fields } => {
-                let fields = fields
-                    .into_iter()
-                    .map(|field| state.register_field_name(field))
-                    .collect::<Vec<_>>();
-                Ok(rename_logical_plan(plan, &fields)?)
-            }
-        }
+        self.resolve_table_provider_with_rename(
+            relation.provider(),
+            UNNAMED_TABLE,
+            None,
+            vec![],
+            None,
+            state,
+        )
     }
 
     pub(super) async fn resolve_query_hint(
@@ -214,12 +203,20 @@ impl PlanResolver<'_> {
 mod tests {
     use std::sync::Arc;
 
+    use async_trait::async_trait;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::catalog::{Session, TableProvider};
     use datafusion::execution::SessionStateBuilder;
-    use datafusion::logical_expr::{lit, LogicalPlanBuilder};
+    use datafusion::logical_expr::{
+        lit, Expr, LogicalPlanBuilder, TableProviderFilterPushDown, TableType,
+    };
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::SessionContext;
     use sail_common_datafusion::extension::SessionExtensionAccessor;
     use sail_common_datafusion::session::remote_relation::{
-        RemoteRelationEntry, RemoteRelationStore,
+        CheckpointRelation, RemoteRelationBacking, RemoteRelationCleanupPolicy,
+        RemoteRelationHandle, RemoteRelationMaterializer, RemoteRelationStore,
     };
 
     use crate::config::PlanConfig;
@@ -235,22 +232,100 @@ mod tests {
         SessionContext::new_with_state(state)
     }
 
-    fn create_deferred_plan() -> datafusion_common::Result<datafusion_expr::LogicalPlan> {
+    fn create_checkpoint_plan() -> datafusion_common::Result<datafusion_expr::LogicalPlan> {
         LogicalPlanBuilder::empty(false)
             .project(vec![lit(1_i64).alias("#cached")])?
             .build()
     }
 
+    #[derive(Debug)]
+    struct TestMaterializer;
+
+    #[async_trait]
+    impl RemoteRelationMaterializer for TestMaterializer {
+        async fn materialize(
+            &self,
+            _state: &dyn Session,
+            _plan: &datafusion_expr::LogicalPlan,
+            schema: Arc<Schema>,
+            _backing: &RemoteRelationBacking,
+        ) -> datafusion_common::Result<Arc<dyn TableProvider>> {
+            Ok(Arc::new(TestTableProvider { schema }))
+        }
+
+        async fn cleanup(
+            &self,
+            _state: &dyn Session,
+            _backing: &RemoteRelationBacking,
+        ) -> datafusion_common::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestTableProvider {
+        schema: Arc<Schema>,
+    }
+
+    #[async_trait]
+    impl TableProvider for TestTableProvider {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> Arc<Schema> {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))))
+        }
+
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> datafusion_common::Result<Vec<TableProviderFilterPushDown>> {
+            Ok(vec![
+                TableProviderFilterPushDown::Unsupported;
+                filters.len()
+            ])
+        }
+    }
+
+    fn create_checkpoint_relation(
+        relation_id: &str,
+    ) -> datafusion_common::Result<Arc<dyn RemoteRelationHandle>> {
+        let schema = Arc::new(Schema::new(vec![Field::new("age", DataType::Int64, false)]));
+        Ok(Arc::new(CheckpointRelation::new(
+            relation_id.to_string(),
+            Arc::clone(&schema),
+            create_checkpoint_plan()?,
+            RemoteRelationBacking::Files {
+                location: "file:///tmp/checkpoints/relation-a".to_string(),
+                format: "parquet".to_string(),
+                cleanup_policy: RemoteRelationCleanupPolicy::RetainOnRemove,
+            },
+            Arc::new(TestMaterializer),
+        )))
+    }
+
     #[tokio::test]
-    async fn test_deferred_remote_relation_registers_current_field_ids() -> PlanResult<()> {
+    async fn test_cached_remote_relation_registers_current_field_ids() -> PlanResult<()> {
         let ctx = create_session();
         let store = ctx.extension::<RemoteRelationStore>()?;
         store.insert(
             "deferred".to_string(),
-            RemoteRelationEntry::Deferred {
-                plan: create_deferred_plan()?,
-                fields: vec!["age".to_string()],
-            },
+            create_checkpoint_relation("deferred")?,
         )?;
 
         let resolver = PlanResolver::new(&ctx, Arc::new(PlanConfig::new()?));
@@ -274,10 +349,7 @@ mod tests {
         let store = ctx.extension::<RemoteRelationStore>()?;
         store.insert(
             "deferred".to_string(),
-            RemoteRelationEntry::Deferred {
-                plan: create_deferred_plan()?,
-                fields: vec!["age".to_string()],
-            },
+            create_checkpoint_relation("deferred")?,
         )?;
         let _ = store.remove("deferred")?;
 
