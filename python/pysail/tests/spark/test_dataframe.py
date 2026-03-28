@@ -1,6 +1,7 @@
 import pandas as pd
 import pytest
 from pandas.testing import assert_frame_equal
+from pyspark import StorageLevel
 from pyspark.sql import Row
 from pyspark.sql.functions import col, lit
 
@@ -166,3 +167,31 @@ def test_checkpoint_lazy_materializes_once_and_survives_source_drop(spark, check
 
     with pytest.raises(Exception, match=r"TABLE_OR_VIEW_NOT_FOUND|not found|unknown"):
         df.collect()
+
+
+@CHECKPOINT_CONNECT_SUPPORTED
+def test_local_checkpoint_materializes_temp_view_input(spark):
+    source = spark.createDataFrame([(1, "alpha"), (2, "beta"), (3, "gamma")], ["id", "value"])
+    source.createOrReplaceTempView("local_checkpoint_source")
+
+    df = spark.table("local_checkpoint_source").where(col("id") >= CHECKPOINT_MIN_ID)
+    checkpointed = df.localCheckpoint()
+
+    spark.catalog.dropTempView("local_checkpoint_source")
+
+    assert_frame_equal(
+        checkpointed.orderBy("id").toPandas(),
+        pd.DataFrame({"id": [2, 3], "value": ["beta", "gamma"]}),
+        check_dtype=False,
+    )
+
+    with pytest.raises(Exception, match=r"TABLE_OR_VIEW_NOT_FOUND|not found|unknown"):
+        df.collect()
+
+
+@CHECKPOINT_CONNECT_SUPPORTED
+def test_local_checkpoint_rejects_storage_level(spark):
+    df = spark.createDataFrame([(1, "alpha")], ["id", "value"])
+
+    with pytest.raises(Exception, match=r"storageLevel"):
+        df.localCheckpoint(storageLevel=StorageLevel.MEMORY_ONLY)

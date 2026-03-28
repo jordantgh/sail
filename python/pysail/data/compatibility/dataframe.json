@@ -254,7 +254,7 @@
     "module": "pyspark.sql.DataFrame",
     "function": "localCheckpoint",
     "status": "partially supported",
-    "note": "Requires a PySpark 4+ Spark Connect client. Supported only in local execution mode. Local checkpoints use session-local parquet files on the server, and storageLevel is not supported yet."
+    "note": "Requires a PySpark 4+ Spark Connect client. Supported only in local execution mode. Eager local checkpoints use session-local parquet files on the server without requiring spark.checkpoint.dir, and storageLevel is not supported yet."
   },
   {
     "module": "pyspark.sql.DataFrame",
