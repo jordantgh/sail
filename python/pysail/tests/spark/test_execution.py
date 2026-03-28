@@ -4,11 +4,17 @@ import pandas as pd
 import pyspark.sql.functions as F  # noqa: N812
 import pytest
 from pandas.testing import assert_frame_equal
+from pyspark import StorageLevel
 from pyspark.sql.types import Row
 from pyspark.sql.window import Window
 
 from pysail.spark import SparkConnectServer
-from pysail.testing.spark.utils.common import is_jvm_spark
+from pysail.testing.spark.utils.common import is_jvm_spark, pyspark_version
+
+CHECKPOINT_CONNECT_SUPPORTED = pytest.mark.skipif(
+    pyspark_version() < (4,),
+    reason="Spark Connect checkpoint APIs require Spark 4+",
+)
 
 
 @pytest.fixture(scope="session")
@@ -234,3 +240,51 @@ class TestLocalClusterExecution:
         coalesced_sum = coalesced.agg(F.sum("value")).collect()[0][0]
         assert coalesced_count == 1000  # noqa: PLR2004
         assert coalesced_sum == original_sum
+
+    @CHECKPOINT_CONNECT_SUPPORTED
+    def test_local_checkpoint_materializes_temp_view_input(self, spark):
+        source = spark.createDataFrame([(1, "alpha"), (2, "beta"), (3, "gamma")], ["id", "value"])
+        source.createOrReplaceTempView("cluster_local_checkpoint_source")
+
+        df = spark.table("cluster_local_checkpoint_source").where(F.col("id") >= 2)
+        checkpointed = df.localCheckpoint(storageLevel=StorageLevel.MEMORY_ONLY)
+
+        spark.catalog.dropTempView("cluster_local_checkpoint_source")
+
+        assert checkpointed.storageLevel == StorageLevel.MEMORY_ONLY
+        assert_frame_equal(
+            checkpointed.orderBy("id").toPandas(),
+            pd.DataFrame({"id": [2, 3], "value": ["beta", "gamma"]}),
+            check_dtype=False,
+        )
+
+        with pytest.raises(Exception, match=r"TABLE_OR_VIEW_NOT_FOUND|not found|unknown"):
+            df.collect()
+
+    @CHECKPOINT_CONNECT_SUPPORTED
+    def test_local_checkpoint_lazy_materializes_once_and_survives_source_drop(self, spark):
+        source = spark.createDataFrame([(1, "alpha"), (2, "beta"), (3, "gamma")], ["id", "value"])
+        source.createOrReplaceTempView("cluster_lazy_local_checkpoint_source")
+
+        df = spark.table("cluster_lazy_local_checkpoint_source").where(F.col("id") >= 2)
+        checkpointed = df.localCheckpoint(False, storageLevel=StorageLevel.DISK_ONLY)
+
+        expected = pd.DataFrame({"id": [2, 3], "value": ["beta", "gamma"]})
+
+        assert checkpointed.storageLevel == StorageLevel.DISK_ONLY
+        assert_frame_equal(
+            checkpointed.orderBy("id").toPandas(),
+            expected,
+            check_dtype=False,
+        )
+
+        spark.catalog.dropTempView("cluster_lazy_local_checkpoint_source")
+
+        assert_frame_equal(
+            checkpointed.orderBy("id").toPandas(),
+            expected,
+            check_dtype=False,
+        )
+
+        with pytest.raises(Exception, match=r"TABLE_OR_VIEW_NOT_FOUND|not found|unknown"):
+            df.collect()
