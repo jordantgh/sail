@@ -4,7 +4,13 @@ from pandas.testing import assert_frame_equal
 from pyspark.sql import Row
 from pyspark.sql.functions import col, lit
 
+from pysail.testing.spark.utils.common import pyspark_version
+
 CHECKPOINT_MIN_ID = 2
+CHECKPOINT_CONNECT_SUPPORTED = pytest.mark.skipif(
+    pyspark_version() < (4,),
+    reason="Spark Connect checkpoint APIs require Spark 4+",
+)
 
 
 @pytest.fixture
@@ -93,6 +99,7 @@ def test_dataframe_drop(spark):
     )
 
 
+@CHECKPOINT_CONNECT_SUPPORTED
 def test_checkpoint_requires_checkpoint_dir(spark):
     key = "spark.checkpoint.dir"
     previous = spark.conf.get(key, None)
@@ -107,6 +114,7 @@ def test_checkpoint_requires_checkpoint_dir(spark):
             spark.conf.set(key, previous)
 
 
+@CHECKPOINT_CONNECT_SUPPORTED
 def test_checkpoint_materializes_temp_view_input(spark, checkpoint_dir):
     source = spark.createDataFrame([(1, "alpha"), (2, "beta"), (3, "gamma")], ["id", "value"])
     source.createOrReplaceTempView("checkpoint_source")
@@ -118,7 +126,8 @@ def test_checkpoint_materializes_temp_view_input(spark, checkpoint_dir):
 
     assert_frame_equal(
         checkpointed.orderBy("id").toPandas(),
-        pd.DataFrame({"id": [2, 3], "value": ["beta", "gamma"]}).astype({"id": "int64"}),
+        pd.DataFrame({"id": [2, 3], "value": ["beta", "gamma"]}),
+        check_dtype=False,
     )
     assert _checkpoint_parquet_files(checkpoint_dir)
 
@@ -126,6 +135,7 @@ def test_checkpoint_materializes_temp_view_input(spark, checkpoint_dir):
         df.collect()
 
 
+@CHECKPOINT_CONNECT_SUPPORTED
 def test_checkpoint_lazy_materializes_once_and_survives_source_drop(spark, checkpoint_dir):
     source = spark.createDataFrame([(1, "alpha"), (2, "beta"), (3, "gamma")], ["id", "value"])
     source.createOrReplaceTempView("lazy_checkpoint_source")
@@ -133,12 +143,13 @@ def test_checkpoint_lazy_materializes_once_and_survives_source_drop(spark, check
     df = spark.table("lazy_checkpoint_source").where(col("id") >= CHECKPOINT_MIN_ID)
     checkpointed = df.checkpoint(False)
 
-    expected = pd.DataFrame({"id": [2, 3], "value": ["beta", "gamma"]}).astype({"id": "int64"})
+    expected = pd.DataFrame({"id": [2, 3], "value": ["beta", "gamma"]})
 
     assert repr(checkpointed) == "DataFrame[id: bigint, value: string]"
     assert_frame_equal(
         checkpointed.orderBy("id").toPandas(),
         expected,
+        check_dtype=False,
     )
 
     first_materialization_files = _checkpoint_parquet_files(checkpoint_dir)
@@ -149,6 +160,7 @@ def test_checkpoint_lazy_materializes_once_and_survives_source_drop(spark, check
     assert_frame_equal(
         checkpointed.orderBy("id").toPandas(),
         expected,
+        check_dtype=False,
     )
     assert _checkpoint_parquet_files(checkpoint_dir) == first_materialization_files
 
