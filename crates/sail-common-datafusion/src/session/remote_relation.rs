@@ -9,6 +9,7 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion_common::{exec_datafusion_err, internal_datafusion_err, Result};
 use datafusion_expr::LogicalPlan;
+use sail_common::spec;
 
 use crate::extension::SessionExtension;
 
@@ -18,11 +19,17 @@ pub enum RemoteRelationCleanupPolicy {
     DeleteOnRemove,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RemoteRelationBacking {
     Files {
         location: String,
         format: String,
+        cleanup_policy: RemoteRelationCleanupPolicy,
+    },
+    LocalCache {
+        storage_level: spec::StorageLevel,
+        location: Option<String>,
+        format: Option<String>,
         cleanup_policy: RemoteRelationCleanupPolicy,
     },
 }
@@ -30,7 +37,16 @@ pub enum RemoteRelationBacking {
 impl RemoteRelationBacking {
     pub fn cleanup_policy(&self) -> RemoteRelationCleanupPolicy {
         match self {
-            Self::Files { cleanup_policy, .. } => *cleanup_policy,
+            Self::Files { cleanup_policy, .. } | Self::LocalCache { cleanup_policy, .. } => {
+                *cleanup_policy
+            }
+        }
+    }
+
+    pub fn storage_level(&self) -> Option<&spec::StorageLevel> {
+        match self {
+            Self::Files { .. } => None,
+            Self::LocalCache { storage_level, .. } => Some(storage_level),
         }
     }
 }
@@ -51,6 +67,8 @@ pub trait RemoteRelationMaterializer: Debug + Send + Sync + 'static {
 #[async_trait]
 pub trait RemoteRelationHandle: Debug + Send + Sync + 'static {
     fn provider(self: Arc<Self>) -> Arc<dyn TableProvider>;
+
+    fn storage_level(&self) -> Option<spec::StorageLevel>;
 
     async fn remove(&self, state: &dyn Session) -> Result<()>;
 }
@@ -249,6 +267,10 @@ impl Debug for CheckpointRelation {
 impl RemoteRelationHandle for CheckpointRelation {
     fn provider(self: Arc<Self>) -> Arc<dyn TableProvider> {
         Arc::new(CheckpointRelationProvider { relation: self })
+    }
+
+    fn storage_level(&self) -> Option<spec::StorageLevel> {
+        self.backing.storage_level().cloned()
     }
 
     async fn remove(&self, state: &dyn Session) -> Result<()> {

@@ -36,6 +36,7 @@ use crate::executor::{
     read_stream, to_arrow_batch, Executor, ExecutorBatch, ExecutorMetadata, ExecutorOutput,
     ExecutorOutputStream,
 };
+use crate::service::{validate_local_checkpoint_storage_level, SparkLocalCheckpointMaterializer};
 use crate::session::SparkSession;
 use crate::spark::connect::execute_plan_response::{
     ResponseType, ResultComplete, SqlCommandResult,
@@ -604,11 +605,6 @@ pub(crate) async fn handle_execute_checkpoint_command(
             "localCheckpoint is only supported in local execution mode",
         ));
     }
-    if local && storage_level.is_some() {
-        return Err(SparkError::unsupported(
-            "localCheckpoint(storageLevel=...) is not supported yet",
-        ));
-    }
 
     let relation = relation.required("checkpoint relation")?;
     let plan: spec::Plan = relation.try_into()?;
@@ -628,22 +624,37 @@ pub(crate) async fn handle_execute_checkpoint_command(
     let fields = fields
         .ok_or_else(|| SparkError::invalid("checkpoint relation must resolve to a query plan"))?;
     let schema = rename_schema(plan.schema().as_arrow(), &fields)?;
-    let location = spark.checkpoint_location(local, &storage_id)?;
-    let backing = RemoteRelationBacking::Files {
-        location,
-        format: "parquet".to_string(),
-        cleanup_policy: if local {
-            RemoteRelationCleanupPolicy::DeleteOnRemove
-        } else {
-            RemoteRelationCleanupPolicy::RetainOnRemove
-        },
+    let backing = if local {
+        let storage_level = storage_level.map(TryInto::try_into).transpose()?;
+        let storage_level = validate_local_checkpoint_storage_level(storage_level)
+            .map_err(SparkError::unsupported)?;
+        RemoteRelationBacking::LocalCache {
+            storage_level: storage_level.clone(),
+            location: storage_level
+                .use_disk
+                .then(|| spark.checkpoint_location(true, &storage_id))
+                .transpose()?,
+            format: storage_level.use_disk.then(|| "arrow".to_string()),
+            cleanup_policy: RemoteRelationCleanupPolicy::DeleteOnRemove,
+        }
+    } else {
+        let location = spark.checkpoint_location(false, &storage_id)?;
+        RemoteRelationBacking::Files {
+            location,
+            format: "parquet".to_string(),
+            cleanup_policy: RemoteRelationCleanupPolicy::RetainOnRemove,
+        }
     };
     let relation = Arc::new(CheckpointRelation::new(
         relation_id.clone(),
         schema,
         plan,
         backing,
-        Arc::new(SparkCheckpointMaterializer),
+        if local {
+            Arc::new(SparkLocalCheckpointMaterializer) as Arc<dyn RemoteRelationMaterializer>
+        } else {
+            Arc::new(SparkCheckpointMaterializer) as Arc<dyn RemoteRelationMaterializer>
+        },
     ));
     if eager {
         let session_state = ctx.state();
@@ -718,7 +729,11 @@ impl RemoteRelationMaterializer for SparkCheckpointMaterializer {
         state: &dyn Session,
         backing: &RemoteRelationBacking,
     ) -> DataFusionResult<()> {
-        let RemoteRelationBacking::Files { location, .. } = backing;
+        let RemoteRelationBacking::Files { location, .. } = backing else {
+            return Err(DataFusionError::Execution(
+                "file-backed checkpoint cleanup requires a file backing".to_string(),
+            ));
+        };
         let parsed = ListingTableUrl::parse(location)?;
         let store = state
             .runtime_env()
@@ -755,7 +770,12 @@ async fn build_checkpoint_provider(
     let registry = ctx.extension::<TableFormatRegistry>()?;
     let RemoteRelationBacking::Files {
         location, format, ..
-    } = backing;
+    } = backing
+    else {
+        return Err(DataFusionError::Execution(
+            "file-backed checkpoint provider requires a file backing".to_string(),
+        ));
+    };
     Ok(registry
         .get(format.as_str())?
         .create_provider(
@@ -780,7 +800,12 @@ fn build_checkpoint_write_plan(
 ) -> DataFusionResult<LogicalPlan> {
     let RemoteRelationBacking::Files {
         location, format, ..
-    } = backing;
+    } = backing
+    else {
+        return Err(DataFusionError::Execution(
+            "checkpoint write plans require a file backing".to_string(),
+        ));
+    };
     let names = schema
         .fields()
         .iter()
