@@ -1,11 +1,11 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use datafusion::catalog::Session;
 use datafusion::common::{internal_datafusion_err, internal_err, Result};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::{execute_stream, ExecutionPlan};
-use datafusion::prelude::SessionContext;
-use sail_common_datafusion::session::job::{JobRunner, JobRunnerHistory};
+use sail_common_datafusion::session::job::{JobRunner, JobRunnerHistory, JobRunnerMode};
 use sail_common_datafusion::system::observable::{JobRunnerObserver, Observer, StateObservable};
 use sail_server::actor::{ActorHandle, ActorSystem};
 use sail_telemetry::telemetry::global_metrics;
@@ -44,9 +44,13 @@ impl StateObservable<JobRunnerObserver> for LocalJobRunner {
 
 #[tonic::async_trait]
 impl JobRunner for LocalJobRunner {
+    fn mode(&self) -> JobRunnerMode {
+        JobRunnerMode::Local
+    }
+
     async fn execute(
         &self,
-        ctx: &SessionContext,
+        ctx: &dyn Session,
         plan: Arc<dyn ExecutionPlan>,
     ) -> Result<SendableRecordBatchStream> {
         if self.stopped.load(Ordering::Relaxed) {
@@ -103,10 +107,14 @@ impl StateObservable<JobRunnerObserver> for ClusterJobRunner {
 
 #[tonic::async_trait]
 impl JobRunner for ClusterJobRunner {
+    fn mode(&self) -> JobRunnerMode {
+        JobRunnerMode::Cluster
+    }
+
     /// Executes a plan on the cluster. This is where the cool stuff happens.
     async fn execute(
         &self,
-        ctx: &SessionContext,
+        ctx: &dyn Session,
         plan: Arc<dyn ExecutionPlan>,
     ) -> Result<SendableRecordBatchStream> {
         let (tx, rx) = oneshot::channel();

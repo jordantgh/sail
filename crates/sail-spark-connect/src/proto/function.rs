@@ -89,7 +89,8 @@ mod tests {
                     let service = context.extension::<JobService>()?;
                     let (plan, _) =
                         resolve_and_execute_plan(&context, spark.plan_config()?, plan).await?;
-                    let stream = service.runner().execute(&context, plan).await?;
+                    let session_state = context.state();
+                    let stream = service.runner().execute(&session_state, plan).await?;
                     read_stream(stream).await
                 });
                 // TODO: validate the result against the expected output
