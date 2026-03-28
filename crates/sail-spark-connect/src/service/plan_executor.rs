@@ -18,6 +18,7 @@ use log::{debug, warn};
 use sail_common::spec;
 use sail_common_datafusion::datasource::{SinkMode, SourceInfo, TableFormatRegistry};
 use sail_common_datafusion::extension::SessionExtensionAccessor;
+use sail_common_datafusion::rename::logical_plan::rename_logical_plan;
 use sail_common_datafusion::rename::schema::rename_schema;
 use sail_common_datafusion::session::job::{JobRunnerMode, JobService};
 use sail_common_datafusion::session::remote_relation::{
@@ -701,7 +702,7 @@ impl RemoteRelationMaterializer for SparkCheckpointMaterializer {
         backing: &RemoteRelationBacking,
     ) -> DataFusionResult<Arc<dyn TableProvider>> {
         self.cleanup(state, backing).await?;
-        let write = build_checkpoint_write_plan(plan.clone(), backing)?;
+        let write = build_checkpoint_write_plan(plan.clone(), schema.as_ref(), backing)?;
         let physical = state.create_physical_plan(&write).await?;
         let service = state.extension::<JobService>()?;
         let stream = service.runner().execute(state, physical).await?;
@@ -773,11 +774,18 @@ async fn build_checkpoint_provider(
 
 fn build_checkpoint_write_plan(
     plan: LogicalPlan,
+    schema: &datafusion::arrow::datatypes::Schema,
     backing: &RemoteRelationBacking,
 ) -> DataFusionResult<LogicalPlan> {
     let RemoteRelationBacking::Files {
         location, format, ..
     } = backing;
+    let names = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().to_string())
+        .collect::<Vec<_>>();
+    let plan = rename_logical_plan(plan, &names)?;
     Ok(LogicalPlan::Extension(Extension {
         node: Arc::new(FileWriteNode::new(
             Arc::new(plan),

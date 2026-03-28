@@ -395,7 +395,7 @@ mod tests {
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::SessionContext;
-    use datafusion_common::{DFSchema, Result};
+    use datafusion_common::{internal_datafusion_err, DFSchema, DataFusionError, Result};
     use datafusion_expr::{EmptyRelation, LogicalPlan};
 
     use super::{
@@ -616,7 +616,7 @@ mod tests {
         relation.remove(&state).await?;
         materializer.release.notify_waiters();
 
-        let error = match materializing
+        let error: DataFusionError = match materializing
             .await
             .map_err(|e| internal_datafusion_err!("{e}"))?
         {
