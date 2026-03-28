@@ -577,8 +577,10 @@ mod tests {
             tokio::spawn(async move { relation.ensure_materialized(&state).await })
         };
 
-        let first = first.await.expect("first task should join")?;
-        let second = second.await.expect("second task should join")?;
+        let first = first.await.map_err(|e| internal_datafusion_err!("{e}"))??;
+        let second = second
+            .await
+            .map_err(|e| internal_datafusion_err!("{e}"))??;
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(materializer.materialize_calls.load(Ordering::SeqCst), 1);
@@ -614,20 +616,31 @@ mod tests {
         relation.remove(&state).await?;
         materializer.release.notify_waiters();
 
-        let error = materializing
+        let error = match materializing
             .await
-            .expect("materializing task should join")
-            .expect_err("removed relation should not publish a provider");
+            .map_err(|e| internal_datafusion_err!("{e}"))?
+        {
+            Ok(_) => {
+                return Err(internal_datafusion_err!(
+                    "removed relation should not publish a provider"
+                ))
+            }
+            Err(error) => error,
+        };
         assert!(error
             .to_string()
             .contains("cached relation has been removed"));
         assert_eq!(materializer.materialize_calls.load(Ordering::SeqCst), 1);
         assert_eq!(materializer.cleanup_calls.load(Ordering::SeqCst), 1);
 
-        let removed = relation
-            .ensure_materialized(&state)
-            .await
-            .expect_err("subsequent access should continue to fail for a removed relation");
+        let removed = match relation.ensure_materialized(&state).await {
+            Ok(_) => {
+                return Err(internal_datafusion_err!(
+                    "subsequent access should continue to fail for a removed relation"
+                ))
+            }
+            Err(error) => error,
+        };
         assert!(removed
             .to_string()
             .contains("cached relation has been removed"));
