@@ -4,6 +4,7 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::Result;
 use datafusion::error::DataFusionError;
+use sail_common::spec;
 
 use crate::id::{TaskStreamKey, TaskStreamKeyDenseDisplay};
 use crate::stream::error::TaskStreamResult;
@@ -19,13 +20,16 @@ pub enum TaskWriteLocation {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum LocalStreamStorage {
     Memory {
         replicas: usize,
     },
     #[expect(unused)]
     Disk,
+    Checkpoint {
+        storage_level: spec::StorageLevel,
+    },
 }
 
 impl fmt::Display for TaskWriteLocation {
@@ -46,6 +50,14 @@ impl fmt::Display for LocalStreamStorage {
         match self {
             Self::Memory { replicas } => write!(f, "Memory({replicas})"),
             Self::Disk => write!(f, "Disk"),
+            Self::Checkpoint { storage_level } => write!(
+                f,
+                "Checkpoint(memory={}, disk={}, deserialized={}, replication={})",
+                storage_level.use_memory,
+                storage_level.use_disk,
+                storage_level.deserialized,
+                storage_level.replication
+            ),
         }
     }
 }
@@ -78,7 +90,6 @@ pub enum TaskStreamSinkState {
     /// The sink is ready to accept more writes.
     Ok,
     /// The sink has encountered an error and no further writes should be attempted.
-    #[expect(unused)]
     Error(DataFusionError),
     /// The sink has been closed and no further writes should be attempted.
     Closed,

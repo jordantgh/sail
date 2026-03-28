@@ -54,6 +54,8 @@ message ExtendedPhysicalPlanNode {
     PythonDataSourceWriteCommitExecNode python_data_source_write_commit = 39;
     CatalogCommandExecNode catalog_command = 40;
     BarrierExecNode barrier = 41;
+    LocalCheckpointReadExecNode local_checkpoint_read = 42;
+    LocalCheckpointWriteExecNode local_checkpoint_write = 43;
   }
 }
 
@@ -318,6 +320,40 @@ message StageInputExecNode {
   EquivalenceProperties eq_properties = 2;
   bytes partitioning = 3;
   bool bounded = 4;
+}
+
+message ExecutionStorageLevel {
+  bool use_disk = 1;
+  bool use_memory = 2;
+  bool use_off_heap = 3;
+  bool deserialized = 4;
+  uint64 replication = 5;
+}
+
+enum LocalCheckpointLocationKind {
+  LOCAL_CHECKPOINT_LOCATION_KIND_DRIVER = 0;
+  LOCAL_CHECKPOINT_LOCATION_KIND_WORKER = 1;
+}
+
+message LocalCheckpointLocation {
+  LocalCheckpointLocationKind kind = 1;
+  optional uint64 worker_id = 2;
+  uint64 job_id = 3;
+  uint64 stage = 4;
+  uint64 partition = 5;
+  uint64 attempt = 6;
+  uint64 channel = 7;
+}
+
+message LocalCheckpointReadExecNode {
+  repeated LocalCheckpointLocation locations = 1;
+  bytes schema = 2;
+}
+
+message LocalCheckpointWriteExecNode {
+  bytes input = 1;
+  uint64 checkpoint_job_id = 2;
+  ExecutionStorageLevel storage_level = 3;
 }
 
 message SystemTableExecNode {

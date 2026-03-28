@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -21,6 +22,8 @@ pub enum JobRunnerMode {
 
 #[tonic::async_trait]
 pub trait JobRunner: StateObservable<JobRunnerObserver> + Send + Sync + 'static {
+    fn as_any(&self) -> &dyn Any;
+
     fn mode(&self) -> JobRunnerMode;
 
     /// Executes a plan

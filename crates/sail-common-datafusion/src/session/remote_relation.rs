@@ -30,6 +30,7 @@ pub enum RemoteRelationBacking {
         storage_level: spec::StorageLevel,
         location: Option<String>,
         format: Option<String>,
+        stream_job_id: Option<u64>,
         cleanup_policy: RemoteRelationCleanupPolicy,
     },
 }

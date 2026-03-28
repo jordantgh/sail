@@ -254,7 +254,7 @@
     "module": "pyspark.sql.DataFrame",
     "function": "localCheckpoint",
     "status": "partially supported",
-    "note": "Requires a PySpark 4+ Spark Connect client. Supported only in local execution mode. Uses a session-local checkpoint store backed by memory and optional temporary Arrow files, supports eager and lazy materialization, and honors local storage levels that keep replication=1 and off-heap storage disabled."
+    "note": "Requires a PySpark 4+ Spark Connect client. Supported in local and local-cluster execution modes. Uses a session-local checkpoint store in local mode and a cluster-backed execution-layer cache in local-cluster mode, supports eager and lazy materialization, and honors memory/disk storage levels while keeping replication=1 and off-heap storage disabled."
   },
   {
     "module": "pyspark.sql.DataFrame",

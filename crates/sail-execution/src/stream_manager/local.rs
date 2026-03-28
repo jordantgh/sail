@@ -1,12 +1,23 @@
 use std::collections::VecDeque;
+use std::fs::{self, File};
+use std::io::Cursor;
+use std::mem;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use datafusion::arrow::array::RecordBatch;
-use datafusion::common::Result;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::ipc::reader::FileReader;
+use datafusion::arrow::ipc::writer::FileWriter;
+use datafusion::common::{internal_datafusion_err, Result};
+use futures::stream;
 use log::debug;
+use sail_common::spec;
 use tokio::sync::mpsc;
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 
 use crate::error::{ExecutionError, ExecutionResult};
+use crate::id::TaskStreamKey;
 use crate::stream::error::TaskStreamResult;
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{TaskStreamSink, TaskStreamSinkState};
@@ -169,5 +180,318 @@ impl TaskStreamSink for MemoryStreamReplicaSender {
             }
         }
         Ok(())
+    }
+}
+
+pub(crate) struct PersistentLocalCheckpointStream {
+    state: Arc<PersistentLocalCheckpointState>,
+    publisher_open: bool,
+}
+
+impl PersistentLocalCheckpointStream {
+    pub fn new(
+        key: &TaskStreamKey,
+        schema: SchemaRef,
+        storage_level: spec::StorageLevel,
+    ) -> ExecutionResult<Self> {
+        let disk_path = storage_level
+            .use_disk
+            .then(|| checkpoint_stream_path(key))
+            .transpose()?;
+        let disk_writer = match &disk_path {
+            Some(path) => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                Some(
+                    FileWriter::try_new(File::create(path)?, &schema).map_err(|e| {
+                        ExecutionError::from(datafusion::error::DataFusionError::from(e))
+                    })?,
+                )
+            }
+            None => None,
+        };
+        Ok(Self {
+            state: Arc::new(PersistentLocalCheckpointState {
+                schema,
+                storage_level,
+                disk_path,
+                inner: Mutex::new(PersistentLocalCheckpointInner::Writing {
+                    memory_batches: Vec::new(),
+                    disk_writer,
+                }),
+            }),
+            publisher_open: true,
+        })
+    }
+}
+
+impl LocalStream for PersistentLocalCheckpointStream {
+    fn publish(&mut self) -> ExecutionResult<Box<dyn TaskStreamSink>> {
+        if !self.publisher_open {
+            return Err(ExecutionError::InternalError(
+                "persistent checkpoint stream can only be written once".to_string(),
+            ));
+        }
+        self.publisher_open = false;
+        Ok(Box::new(PersistentLocalCheckpointSink {
+            state: Arc::clone(&self.state),
+        }))
+    }
+
+    fn subscribe(&mut self) -> ExecutionResult<TaskStreamSource> {
+        self.state.subscribe()
+    }
+}
+
+struct PersistentLocalCheckpointState {
+    schema: SchemaRef,
+    storage_level: spec::StorageLevel,
+    disk_path: Option<PathBuf>,
+    inner: Mutex<PersistentLocalCheckpointInner>,
+}
+
+enum PersistentLocalCheckpointInner {
+    Writing {
+        memory_batches: Vec<RecordBatch>,
+        disk_writer: Option<FileWriter<File>>,
+    },
+    Ready {
+        memory: Option<PersistentLocalCheckpointMemory>,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+enum PersistentLocalCheckpointMemory {
+    Deserialized(Vec<RecordBatch>),
+    Serialized(Vec<u8>),
+}
+
+impl PersistentLocalCheckpointState {
+    fn subscribe(&self) -> ExecutionResult<TaskStreamSource> {
+        let batches = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|error| ExecutionError::InternalError(error.to_string()))?;
+            match &*inner {
+                PersistentLocalCheckpointInner::Writing { .. } => {
+                    return Err(ExecutionError::InternalError(
+                        "persistent checkpoint stream is not ready for reading".to_string(),
+                    ));
+                }
+                PersistentLocalCheckpointInner::Ready { memory } => {
+                    if let Some(memory) = memory {
+                        match memory {
+                            PersistentLocalCheckpointMemory::Deserialized(batches) => {
+                                batches.clone()
+                            }
+                            PersistentLocalCheckpointMemory::Serialized(bytes) => {
+                                deserialize_batches(bytes.as_slice())?
+                            }
+                        }
+                    } else {
+                        let path = self.disk_path.as_ref().ok_or_else(|| {
+                            ExecutionError::InternalError(
+                                "persistent checkpoint stream is missing its disk backing"
+                                    .to_string(),
+                            )
+                        })?;
+                        read_batches_from_disk(path)?
+                    }
+                }
+                PersistentLocalCheckpointInner::Failed { message } => {
+                    return Err(ExecutionError::InternalError(message.clone()));
+                }
+            }
+        };
+        let stream = stream::iter(batches.into_iter().map(Ok));
+        Ok(Box::pin(stream))
+    }
+}
+
+impl Drop for PersistentLocalCheckpointState {
+    fn drop(&mut self) {
+        let Some(path) = self.disk_path.take() else {
+            return;
+        };
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => debug!(
+                "failed to remove checkpoint stream file {}: {error}",
+                path.display()
+            ),
+        }
+        remove_empty_checkpoint_parents(path.parent());
+    }
+}
+
+struct PersistentLocalCheckpointSink {
+    state: Arc<PersistentLocalCheckpointState>,
+}
+
+#[tonic::async_trait]
+impl TaskStreamSink for PersistentLocalCheckpointSink {
+    async fn write(&mut self, batch: TaskStreamResult<RecordBatch>) -> TaskStreamSinkState {
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(error) => {
+                let message = error.to_string();
+                if let Ok(mut inner) = self.state.inner.lock() {
+                    *inner = PersistentLocalCheckpointInner::Failed {
+                        message: message.clone(),
+                    };
+                }
+                return TaskStreamSinkState::Error(datafusion::error::DataFusionError::External(
+                    Box::new(error),
+                ));
+            }
+        };
+
+        let mut inner = match self.state.inner.lock() {
+            Ok(inner) => inner,
+            Err(error) => {
+                return TaskStreamSinkState::Error(internal_datafusion_err!("{error}"));
+            }
+        };
+        let PersistentLocalCheckpointInner::Writing {
+            memory_batches,
+            disk_writer,
+        } = &mut *inner
+        else {
+            return TaskStreamSinkState::Error(internal_datafusion_err!(
+                "persistent checkpoint stream is no longer writable"
+            ));
+        };
+
+        if self.state.storage_level.use_memory {
+            memory_batches.push(batch.clone());
+        }
+        if let Some(writer) = disk_writer.as_mut() {
+            if let Err(error) = writer.write(&batch) {
+                *inner = PersistentLocalCheckpointInner::Failed {
+                    message: error.to_string(),
+                };
+                return TaskStreamSinkState::Error(error.into());
+            }
+        }
+        TaskStreamSinkState::Ok
+    }
+
+    async fn close(self: Box<Self>) -> Result<()> {
+        let mut inner = self
+            .state
+            .inner
+            .lock()
+            .map_err(|error| internal_datafusion_err!("{error}"))?;
+        let next = match mem::replace(
+            &mut *inner,
+            PersistentLocalCheckpointInner::Failed {
+                message: "persistent checkpoint stream closed unexpectedly".to_string(),
+            },
+        ) {
+            PersistentLocalCheckpointInner::Writing {
+                memory_batches,
+                mut disk_writer,
+            } => {
+                if let Some(writer) = disk_writer.as_mut() {
+                    writer.finish()?;
+                }
+                let memory = if self.state.storage_level.use_memory {
+                    Some(if self.state.storage_level.deserialized {
+                        PersistentLocalCheckpointMemory::Deserialized(memory_batches)
+                    } else {
+                        PersistentLocalCheckpointMemory::Serialized(serialize_batches(
+                            &self.state.schema,
+                            &memory_batches,
+                        )?)
+                    })
+                } else {
+                    None
+                };
+                PersistentLocalCheckpointInner::Ready { memory }
+            }
+            PersistentLocalCheckpointInner::Ready { memory } => {
+                *inner = PersistentLocalCheckpointInner::Ready { memory };
+                return Err(internal_datafusion_err!(
+                    "persistent checkpoint stream has already been closed"
+                ));
+            }
+            PersistentLocalCheckpointInner::Failed { message } => {
+                *inner = PersistentLocalCheckpointInner::Failed { message };
+                return Err(internal_datafusion_err!(
+                    "persistent checkpoint stream failed before close"
+                ));
+            }
+        };
+        *inner = next;
+        Ok(())
+    }
+}
+
+fn serialize_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    {
+        let mut writer = FileWriter::try_new(&mut bytes, schema)?;
+        for batch in batches {
+            writer.write(batch)?;
+        }
+        writer.finish()?;
+    }
+    Ok(bytes)
+}
+
+fn deserialize_batches(bytes: &[u8]) -> ExecutionResult<Vec<RecordBatch>> {
+    let reader = FileReader::try_new(Cursor::new(bytes), None)
+        .map_err(|error| ExecutionError::InternalError(error.to_string()))?;
+    reader
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| ExecutionError::InternalError(error.to_string()))
+}
+
+fn read_batches_from_disk(path: &Path) -> ExecutionResult<Vec<RecordBatch>> {
+    let reader = FileReader::try_new(File::open(path)?, None)
+        .map_err(|error| ExecutionError::InternalError(error.to_string()))?;
+    reader
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| ExecutionError::InternalError(error.to_string()))
+}
+
+fn checkpoint_stream_path(key: &TaskStreamKey) -> ExecutionResult<PathBuf> {
+    let root = std::env::temp_dir()
+        .join("sail-local-checkpoint-streams")
+        .join(key.job_id.to_string())
+        .join(key.stage.to_string())
+        .join(key.partition.to_string());
+    Ok(root.join(format!(
+        "attempt-{}-channel-{}.arrow",
+        key.attempt, key.channel
+    )))
+}
+
+fn remove_empty_checkpoint_parents(path: Option<&Path>) {
+    let mut current = path.map(Path::to_path_buf);
+    while let Some(path) = current {
+        match fs::remove_dir(&path) {
+            Ok(()) => {
+                current = path.parent().map(Path::to_path_buf);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                current = path.parent().map(Path::to_path_buf);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                break;
+            }
+            Err(error) => {
+                debug!(
+                    "failed to remove checkpoint stream directory {}: {error}",
+                    path.display()
+                );
+                break;
+            }
+        }
     }
 }

@@ -19,13 +19,14 @@ use tokio::time::Instant;
 use crate::driver::actor::DriverActor;
 use crate::driver::job_scheduler::{JobAction, TaskState};
 use crate::driver::output::JobOutputItem;
-use crate::driver::{DriverEvent, TaskStatus};
+use crate::driver::{DriverEvent, LocalCheckpointStreamOwner, TaskStatus};
 use crate::error::ExecutionResult;
 use crate::id::{JobId, TaskKey, TaskKeyDisplay, TaskStreamKey, TaskStreamKeyDisplay, WorkerId};
 use crate::stream::error::TaskStreamError;
-use crate::stream::reader::TaskStreamSource;
+use crate::stream::reader::{TaskReadLocation, TaskStreamSource};
 use crate::stream::writer::{LocalStreamStorage, TaskStreamSink};
 use crate::task::scheduling::{TaskAssignment, TaskAssignmentGetter, TaskStreamAssignment};
+use crate::task_runner::LocalCheckpointRegistrarContext;
 
 impl DriverActor {
     pub(super) fn handle_server_ready(
@@ -177,6 +178,61 @@ impl DriverActor {
             self.scale_up_workers(ctx);
         }
         let _ = result.send(out.map(|(_, stream)| stream));
+        ActorAction::Continue
+    }
+
+    pub(super) fn handle_begin_local_checkpoint_materialization(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        checkpoint_job_id: JobId,
+        partitions: usize,
+        result: oneshot::Sender<ExecutionResult<()>>,
+    ) -> ActorAction {
+        let _ = result.send(self.local_checkpoints.begin(checkpoint_job_id, partitions));
+        ActorAction::Continue
+    }
+
+    pub(super) fn handle_register_local_checkpoint_partition(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        checkpoint_job_id: JobId,
+        key: TaskStreamKey,
+        owner: LocalCheckpointStreamOwner,
+    ) -> ActorAction {
+        if let Err(error) = self
+            .local_checkpoints
+            .register(checkpoint_job_id, key.clone(), owner)
+        {
+            warn!(
+                "failed to register local checkpoint partition for {}: {error}",
+                TaskStreamKeyDisplay(&key)
+            );
+        }
+        ActorAction::Continue
+    }
+
+    pub(super) fn handle_finalize_local_checkpoint_materialization(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        checkpoint_job_id: JobId,
+        result: oneshot::Sender<ExecutionResult<Vec<TaskReadLocation>>>,
+    ) -> ActorAction {
+        let _ = result.send(self.local_checkpoints.finalize(checkpoint_job_id));
+        ActorAction::Continue
+    }
+
+    pub(super) fn handle_remove_local_checkpoint_materialization(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        checkpoint_job_id: JobId,
+        result: oneshot::Sender<ExecutionResult<()>>,
+    ) -> ActorAction {
+        self.local_checkpoints.remove(checkpoint_job_id);
+        self.stream_manager
+            .remove_local_streams(checkpoint_job_id, None);
+        self.worker_pool
+            .clean_up_job_all(ctx, checkpoint_job_id, None);
+        let _ = result.send(Ok(()));
         ActorAction::Continue
     }
 
@@ -540,9 +596,15 @@ impl DriverActor {
                 self.job_scheduler
                     .update_task(&entry.key, TaskState::Scheduled, None, None);
                 match assignment.assignment {
-                    TaskAssignment::Driver => self
-                        .task_runner
-                        .run_task(ctx, entry.key, definition, context),
+                    TaskAssignment::Driver => self.task_runner.run_task(
+                        ctx,
+                        entry.key,
+                        definition,
+                        context,
+                        LocalCheckpointRegistrarContext::Driver {
+                            handle: ctx.handle().clone(),
+                        },
+                    ),
                     TaskAssignment::Worker { worker_id, slot: _ } => self
                         .worker_pool
                         .run_task(ctx, worker_id, entry.key, definition),

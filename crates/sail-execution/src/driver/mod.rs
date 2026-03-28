@@ -1,4 +1,5 @@
 mod actor;
+mod checkpoint;
 mod client;
 mod event;
 pub(super) mod job_scheduler;
@@ -17,7 +18,8 @@ mod gen {
 }
 
 pub(crate) use actor::DriverActor;
-pub(crate) use client::DriverClientSet;
+pub(crate) use checkpoint::{LocalCheckpointRegistry, LocalCheckpointStreamOwner};
+pub(crate) use client::{DriverClient, DriverClientSet};
 pub(crate) use event::{DriverEvent, TaskStatus};
 pub(crate) use gen::driver_service_client::DriverServiceClient;
 pub use options::DriverOptions;
