@@ -2,14 +2,13 @@ name: Build
 
 on:
   push:
-    branches: [main]
   pull_request:
-    branches: [main]
     types:
       - labeled
       - opened
       - reopened
       - synchronize
+  workflow_dispatch:
 
 jobs:
   setup:
@@ -143,7 +142,7 @@ jobs:
 
   codecov-notify:
     name: Codecov Notify
-    if: ${{ !cancelled() && github.actor != 'dependabot[bot]' }}
+    if: ${{ !cancelled() && github.actor != 'dependabot[bot]' && github.repository == 'lakehq/sail' }}
     runs-on: ubuntu-slim
     needs:
       - rust-tests
