@@ -192,13 +192,7 @@ pub(crate) async fn handle_analyze_get_storage_level(
         }
         _ => None,
     }
-    .unwrap_or(spec::StorageLevel {
-        use_disk: false,
-        use_memory: false,
-        use_off_heap: false,
-        deserialized: false,
-        replication: 1,
-    });
+    .unwrap_or_else(legacy_storage_level_fallback);
     Ok(GetStorageLevelResponse {
         storage_level: Some(StorageLevel {
             use_disk: storage_level.use_disk,
@@ -208,6 +202,23 @@ pub(crate) async fn handle_analyze_get_storage_level(
             replication: storage_level.replication as i32,
         }),
     })
+}
+
+fn legacy_storage_level_fallback() -> spec::StorageLevel {
+    // Until Spark Connect persist/cache is implemented server-side, preserve the
+    // legacy non-NONE fallback for ordinary relations. Existing client flows
+    // such as Ibis' temp-table cache helper rely on `DataFrame.cache()` reading
+    // back as cached even though Sail does not materialize those relations yet.
+    //
+    // Checkpoint-backed CachedRemoteRelation handles still override this with
+    // their actual configured storage level metadata above.
+    spec::StorageLevel {
+        use_disk: false,
+        use_memory: true,
+        use_off_heap: true,
+        deserialized: false,
+        replication: 1,
+    }
 }
 
 pub(crate) async fn handle_analyze_json_to_ddl(
