@@ -2,15 +2,14 @@ name: Python Lint
 
 on:
   push:
-    branches: [main]
   pull_request:
-    branches: [main]
     paths:
       - ".github/**"
       - "python/**"
       - "crates/**/*.py"
       - "scripts/**/*.py"
       - "pyproject.toml"
+  workflow_dispatch:
 
 jobs:
   lint:

@@ -2,9 +2,7 @@ name: Rust Lint
 
 on:
   push:
-    branches: [main]
   pull_request:
-    branches: [main]
     paths:
       - ".github/**"
       - "crates/**"
@@ -12,6 +10,7 @@ on:
       - "Cargo.lock"
       - "clippy.toml"
       - "rustfmt.toml"
+  workflow_dispatch:
 
 jobs:
   lint:
