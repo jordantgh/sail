@@ -6464,6 +6464,7 @@ name = "sail-spark-connect"
 version = "0.5.3"
 dependencies = [
  "async-stream",
+ "async-trait",
  "datafusion",
  "fastrace",
  "futures",
@@ -6486,6 +6487,7 @@ dependencies = [
  "sail-common-datafusion",
  "sail-data-source",
  "sail-execution",
+ "sail-logical-plan",
  "sail-plan",
  "sail-python-udf",
  "sail-server",
@@ -6494,12 +6496,14 @@ dependencies = [
  "serde",
  "serde_json",
  "syn 2.0.117",
+ "tempfile",
  "thiserror",
  "tokio",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
  "tonic-types",
+ "url",
  "uuid",
 ]
 

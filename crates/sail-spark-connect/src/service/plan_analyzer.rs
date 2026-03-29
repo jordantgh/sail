@@ -3,6 +3,7 @@ use log::warn;
 use sail_common::spec;
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::rename::schema::rename_schema;
+use sail_common_datafusion::session::remote_relation::RemoteRelationStore;
 use sail_plan::explain::{explain_string, ExplainOptions};
 use sail_plan::resolver::plan::NamedPlan;
 use sail_plan::resolver::PlanResolver;
@@ -172,16 +173,39 @@ pub(crate) async fn handle_analyze_unpersist(
 }
 
 pub(crate) async fn handle_analyze_get_storage_level(
-    _ctx: &SessionContext,
-    _request: GetStorageLevelRequest,
+    ctx: &SessionContext,
+    request: GetStorageLevelRequest,
 ) -> SparkResult<GetStorageLevelResponse> {
+    let relation = request.relation.required("relation")?;
+    let plan: spec::Plan = relation.try_into()?;
+    let storage_level = match plan {
+        spec::Plan::Query(query)
+            if matches!(query.node, spec::QueryNode::CachedRemoteRelation { .. }) =>
+        {
+            let spec::QueryNode::CachedRemoteRelation { relation_id } = query.node else {
+                unreachable!("matched above")
+            };
+            let store = ctx.extension::<RemoteRelationStore>()?;
+            store
+                .get(&relation_id)?
+                .and_then(|relation| relation.storage_level())
+        }
+        _ => None,
+    }
+    .unwrap_or(spec::StorageLevel {
+        use_disk: false,
+        use_memory: false,
+        use_off_heap: false,
+        deserialized: false,
+        replication: 1,
+    });
     Ok(GetStorageLevelResponse {
         storage_level: Some(StorageLevel {
-            use_disk: false,
-            use_memory: true,
-            use_off_heap: true,
-            deserialized: false,
-            replication: 1,
+            use_disk: storage_level.use_disk,
+            use_memory: storage_level.use_memory,
+            use_off_heap: storage_level.use_off_heap,
+            deserialized: storage_level.deserialized,
+            replication: storage_level.replication as i32,
         }),
     })
 }

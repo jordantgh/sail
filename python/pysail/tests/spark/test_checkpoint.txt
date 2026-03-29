@@ -1,0 +1,8 @@
+>>> # The tests are adapted from the doctests of the
+>>> # `pyspark.sql.dataframe.DataFrame.checkpoint()` method.
+>>> from pathlib import Path
+>>> import tempfile
+>>> spark.conf.set("spark.checkpoint.dir", Path(tempfile.mkdtemp(prefix="pysail-checkpoint-")).as_uri())
+>>> df = spark.createDataFrame([(14, "Tom"), (23, "Alice"), (16, "Bob")], ["age", "name"])
+>>> df.checkpoint(False)
+DataFrame[age: bigint, name: string]

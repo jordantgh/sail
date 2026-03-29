@@ -57,7 +57,7 @@ where
         let (tx, rx) = oneshot::channel();
         let event = match location {
             TaskWriteLocation::Local { key, storage } => {
-                T::Message::create_local_stream(key.clone(), *storage, schema, tx)
+                T::Message::create_local_stream(key.clone(), storage.clone(), schema, tx)
             }
             TaskWriteLocation::Remote { uri, key } => {
                 T::Message::create_remote_stream(uri.clone(), key.clone(), schema, tx)

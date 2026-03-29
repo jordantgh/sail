@@ -15,4 +15,7 @@ mod task_runner;
 mod worker;
 pub mod worker_manager;
 
+pub use id::JobId;
+pub use plan::{LocalCheckpointReadExec, LocalCheckpointWriteExec};
+pub use stream::reader::TaskReadLocation;
 pub use worker::entrypoint::run_worker;

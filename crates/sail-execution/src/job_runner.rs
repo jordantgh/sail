@@ -1,11 +1,11 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use datafusion::catalog::Session;
 use datafusion::common::{internal_datafusion_err, internal_err, Result};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::{execute_stream, ExecutionPlan};
-use datafusion::prelude::SessionContext;
-use sail_common_datafusion::session::job::{JobRunner, JobRunnerHistory};
+use sail_common_datafusion::session::job::{JobRunner, JobRunnerHistory, JobRunnerMode};
 use sail_common_datafusion::system::observable::{JobRunnerObserver, Observer, StateObservable};
 use sail_server::actor::{ActorHandle, ActorSystem};
 use sail_telemetry::telemetry::global_metrics;
@@ -14,6 +14,8 @@ use tokio::sync::mpsc::error::SendError;
 use tokio::sync::oneshot;
 
 use crate::driver::{DriverActor, DriverEvent, DriverOptions};
+use crate::id::JobId;
+use crate::stream::reader::TaskReadLocation;
 
 pub struct LocalJobRunner {
     next_job_id: AtomicU64,
@@ -44,9 +46,17 @@ impl StateObservable<JobRunnerObserver> for LocalJobRunner {
 
 #[tonic::async_trait]
 impl JobRunner for LocalJobRunner {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn mode(&self) -> JobRunnerMode {
+        JobRunnerMode::Local
+    }
+
     async fn execute(
         &self,
-        ctx: &SessionContext,
+        ctx: &dyn Session,
         plan: Arc<dyn ExecutionPlan>,
     ) -> Result<SendableRecordBatchStream> {
         if self.stopped.load(Ordering::Relaxed) {
@@ -84,6 +94,59 @@ impl ClusterJobRunner {
         let driver = system.spawn(options);
         Self { driver }
     }
+
+    pub async fn begin_local_checkpoint_materialization(
+        &self,
+        checkpoint_job_id: JobId,
+        partitions: usize,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.driver
+            .send(DriverEvent::BeginLocalCheckpointMaterialization {
+                checkpoint_job_id,
+                partitions,
+                result: tx,
+            })
+            .await
+            .map_err(|e| internal_datafusion_err!("{e}"))?;
+        rx.await
+            .map_err(|e| internal_datafusion_err!("failed to begin local checkpoint: {e}"))?
+            .map_err(|e| internal_datafusion_err!("{e}"))
+    }
+
+    pub async fn finalize_local_checkpoint_materialization(
+        &self,
+        checkpoint_job_id: JobId,
+    ) -> Result<Vec<TaskReadLocation>> {
+        let (tx, rx) = oneshot::channel();
+        self.driver
+            .send(DriverEvent::FinalizeLocalCheckpointMaterialization {
+                checkpoint_job_id,
+                result: tx,
+            })
+            .await
+            .map_err(|e| internal_datafusion_err!("{e}"))?;
+        rx.await
+            .map_err(|e| internal_datafusion_err!("failed to finalize local checkpoint: {e}"))?
+            .map_err(|e| internal_datafusion_err!("{e}"))
+    }
+
+    pub async fn remove_local_checkpoint_materialization(
+        &self,
+        checkpoint_job_id: JobId,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.driver
+            .send(DriverEvent::RemoveLocalCheckpointMaterialization {
+                checkpoint_job_id,
+                result: tx,
+            })
+            .await
+            .map_err(|e| internal_datafusion_err!("{e}"))?;
+        rx.await
+            .map_err(|e| internal_datafusion_err!("failed to remove local checkpoint: {e}"))?
+            .map_err(|e| internal_datafusion_err!("{e}"))
+    }
 }
 
 #[tonic::async_trait]
@@ -103,10 +166,18 @@ impl StateObservable<JobRunnerObserver> for ClusterJobRunner {
 
 #[tonic::async_trait]
 impl JobRunner for ClusterJobRunner {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn mode(&self) -> JobRunnerMode {
+        JobRunnerMode::Cluster
+    }
+
     /// Executes a plan on the cluster. This is where the cool stuff happens.
     async fn execute(
         &self,
-        ctx: &SessionContext,
+        ctx: &dyn Session,
         plan: Arc<dyn ExecutionPlan>,
     ) -> Result<SendableRecordBatchStream> {
         let (tx, rx) = oneshot::channel();
