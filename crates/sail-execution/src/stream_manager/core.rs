@@ -15,7 +15,7 @@ use crate::id::{JobId, TaskStreamKey, TaskStreamKeyDisplay};
 use crate::stream::error::{TaskStreamError, TaskStreamResult};
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{LocalStreamStorage, TaskStreamSink};
-use crate::stream_manager::local::{LocalStream, MemoryStream};
+use crate::stream_manager::local::{LocalStream, MemoryStream, PersistentLocalCheckpointStream};
 use crate::stream_manager::options::StreamManagerOptions;
 use crate::stream_manager::{LocalStreamState, StreamManager, StreamManagerMessage};
 
@@ -34,8 +34,13 @@ impl StreamManager {
         _schema: SchemaRef,
     ) -> ExecutionResult<Box<dyn TaskStreamSink>> {
         let create = |senders: Vec<_>| -> ExecutionResult<_> {
-            let mut stream =
-                Self::create_local_stream_with_senders(storage, senders, &self.options)?;
+            let mut stream = Self::create_local_stream_with_senders(
+                &key,
+                storage.clone(),
+                senders,
+                &self.options,
+                _schema.clone(),
+            )?;
             let sink = stream.publish()?;
             Ok((stream, sink))
         };
@@ -197,9 +202,11 @@ impl StreamManager {
     }
 
     fn create_local_stream_with_senders(
+        key: &TaskStreamKey,
         storage: LocalStreamStorage,
         senders: Vec<mpsc::Sender<TaskStreamResult<RecordBatch>>>,
         options: &StreamManagerOptions,
+        schema: SchemaRef,
     ) -> ExecutionResult<Box<dyn LocalStream>> {
         match storage {
             LocalStreamStorage::Memory { replicas } => Ok(Box::new(MemoryStream::new(
@@ -210,6 +217,19 @@ impl StreamManager {
             LocalStreamStorage::Disk => Err(ExecutionError::InternalError(
                 "not implemented: local disk storage".to_string(),
             )),
+            LocalStreamStorage::Checkpoint { storage_level } => {
+                if !senders.is_empty() {
+                    return Err(ExecutionError::InternalError(
+                        "persistent checkpoint streams do not support pending subscribers"
+                            .to_string(),
+                    ));
+                }
+                Ok(Box::new(PersistentLocalCheckpointStream::new(
+                    key,
+                    schema,
+                    storage_level,
+                )?))
+            }
         }
     }
 }

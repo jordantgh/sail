@@ -407,6 +407,18 @@ impl WorkerPool {
         Self::clean_up_job_for_worker(ctx, job_id, stage, worker_id, worker, &self.options);
     }
 
+    pub fn clean_up_job_all(
+        &mut self,
+        ctx: &mut ActorContext<DriverActor>,
+        job_id: JobId,
+        stage: Option<usize>,
+    ) {
+        let worker_ids = self.workers.keys().copied().collect::<Vec<_>>();
+        for worker_id in worker_ids {
+            self.clean_up_job(ctx, worker_id, job_id, stage);
+        }
+    }
+
     fn get_client_set(
         worker_id: WorkerId,
         worker: &mut WorkerDescriptor,

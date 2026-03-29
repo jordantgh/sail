@@ -71,6 +71,7 @@ use datafusion_spark::function::url::url_decode::UrlDecode;
 use datafusion_spark::function::url::url_encode::UrlEncode;
 use prost::Message;
 use sail_catalog_system::physical_plan::SystemTableExec;
+use sail_common::spec;
 use sail_common_datafusion::array::record_batch::{read_record_batches, write_record_batches};
 use sail_common_datafusion::catalog::{CatalogPartitionField, PartitionTransform};
 use sail_common_datafusion::datasource::PhysicalSinkMode;
@@ -201,6 +202,7 @@ use sail_python_udf::udf::pyspark_udf::{PySparkUDF, PySparkUdfKind};
 use sail_python_udf::udf::pyspark_udtf::{PySparkUDTF, PySparkUdtfKind};
 use url::Url;
 
+use crate::id::{JobId, TaskStreamKey, WorkerId};
 use crate::plan::gen::extended_aggregate_udf::UdafKind;
 use crate::plan::gen::extended_physical_expr_node::ExprKind;
 use crate::plan::gen::extended_physical_plan_node::NodeKind;
@@ -210,7 +212,8 @@ use crate::plan::gen::{
     DeltaCastColumnExprNode, ExtendedAggregateUdf, ExtendedPhysicalExprNode,
     ExtendedPhysicalPlanNode, ExtendedScalarUdf, ExtendedStreamUdf,
 };
-use crate::plan::{gen, StageInputExec};
+use crate::plan::{gen, LocalCheckpointReadExec, LocalCheckpointWriteExec, StageInputExec};
+use crate::stream::reader::TaskReadLocation;
 
 pub struct RemoteExecutionCodec;
 
@@ -299,6 +302,34 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 );
                 let node = StageInputExec::new(input as usize, properties);
                 Ok(Arc::new(node))
+            }
+            NodeKind::LocalCheckpointRead(gen::LocalCheckpointReadExecNode {
+                locations,
+                schema,
+            }) => {
+                let schema = self.try_decode_schema(&schema)?;
+                let locations = locations
+                    .into_iter()
+                    .map(|location| self.try_decode_local_checkpoint_location(location))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Arc::new(LocalCheckpointReadExec::new(
+                    locations,
+                    Arc::new(schema),
+                )))
+            }
+            NodeKind::LocalCheckpointWrite(gen::LocalCheckpointWriteExecNode {
+                input,
+                checkpoint_job_id,
+                storage_level,
+            }) => {
+                let Some(storage_level) = storage_level else {
+                    return plan_err!("no storage level found for LocalCheckpointWriteExec");
+                };
+                Ok(Arc::new(LocalCheckpointWriteExec::new(
+                    self.try_decode_plan(&input, ctx)?,
+                    checkpoint_job_id.into(),
+                    self.try_decode_storage_level(storage_level)?,
+                )))
             }
             NodeKind::SystemTable(gen::SystemTableExecNode {
                 table,
@@ -1113,6 +1144,28 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 eq_properties: Some(eq_properties),
                 partitioning,
                 bounded,
+            })
+        } else if let Some(local_checkpoint_read) =
+            node.as_any().downcast_ref::<LocalCheckpointReadExec>()
+        {
+            let schema = self.try_encode_schema(local_checkpoint_read.schema().as_ref())?;
+            NodeKind::LocalCheckpointRead(gen::LocalCheckpointReadExecNode {
+                locations: local_checkpoint_read
+                    .locations()
+                    .iter()
+                    .map(|location| self.try_encode_local_checkpoint_location(location))
+                    .collect::<Result<Vec<_>>>()?,
+                schema,
+            })
+        } else if let Some(local_checkpoint_write) =
+            node.as_any().downcast_ref::<LocalCheckpointWriteExec>()
+        {
+            NodeKind::LocalCheckpointWrite(gen::LocalCheckpointWriteExecNode {
+                input: self.try_encode_plan(local_checkpoint_write.input().clone())?,
+                checkpoint_job_id: local_checkpoint_write.checkpoint_job_id().into(),
+                storage_level: Some(
+                    self.try_encode_storage_level(local_checkpoint_write.storage_level())?,
+                ),
             })
         } else if let Some(system_table) = node.as_any().downcast_ref::<SystemTableExec>() {
             let table = serde_json::to_string(&system_table.table())
@@ -3104,6 +3157,106 @@ impl RemoteExecutionCodec {
 
     fn try_encode_schema(&self, schema: &Schema) -> Result<Vec<u8>> {
         self.try_encode_message::<gen_datafusion_common::Schema>(schema.try_into()?)
+    }
+
+    fn try_decode_storage_level(
+        &self,
+        level: gen::ExecutionStorageLevel,
+    ) -> Result<spec::StorageLevel> {
+        let gen::ExecutionStorageLevel {
+            use_disk,
+            use_memory,
+            use_off_heap,
+            deserialized,
+            replication,
+        } = level;
+        Ok(spec::StorageLevel {
+            use_disk,
+            use_memory,
+            use_off_heap,
+            deserialized,
+            replication: replication as usize,
+        })
+    }
+
+    fn try_encode_storage_level(
+        &self,
+        level: &spec::StorageLevel,
+    ) -> Result<gen::ExecutionStorageLevel> {
+        Ok(gen::ExecutionStorageLevel {
+            use_disk: level.use_disk,
+            use_memory: level.use_memory,
+            use_off_heap: level.use_off_heap,
+            deserialized: level.deserialized,
+            replication: level.replication as u64,
+        })
+    }
+
+    fn try_decode_local_checkpoint_location(
+        &self,
+        location: gen::LocalCheckpointLocation,
+    ) -> Result<TaskReadLocation> {
+        let gen::LocalCheckpointLocation {
+            kind,
+            worker_id,
+            job_id,
+            stage,
+            partition,
+            attempt,
+            channel,
+        } = location;
+        let key = TaskStreamKey {
+            job_id: JobId::from(job_id),
+            stage: stage as usize,
+            partition: partition as usize,
+            attempt: attempt as usize,
+            channel: channel as usize,
+        };
+        match gen::LocalCheckpointLocationKind::try_from(kind)
+            .map_err(|e| plan_datafusion_err!("{e}"))?
+        {
+            gen::LocalCheckpointLocationKind::Driver => Ok(TaskReadLocation::Driver { key }),
+            gen::LocalCheckpointLocationKind::Worker => {
+                let worker_id = worker_id.ok_or_else(|| {
+                    plan_datafusion_err!(
+                        "worker local checkpoint location requires a worker identifier"
+                    )
+                })?;
+                Ok(TaskReadLocation::Worker {
+                    worker_id: WorkerId::from(worker_id),
+                    key,
+                })
+            }
+        }
+    }
+
+    fn try_encode_local_checkpoint_location(
+        &self,
+        location: &TaskReadLocation,
+    ) -> Result<gen::LocalCheckpointLocation> {
+        match location {
+            TaskReadLocation::Driver { key } => Ok(gen::LocalCheckpointLocation {
+                kind: gen::LocalCheckpointLocationKind::Driver as i32,
+                worker_id: None,
+                job_id: key.job_id.into(),
+                stage: key.stage as u64,
+                partition: key.partition as u64,
+                attempt: key.attempt as u64,
+                channel: key.channel as u64,
+            }),
+            TaskReadLocation::Worker { worker_id, key } => Ok(gen::LocalCheckpointLocation {
+                kind: gen::LocalCheckpointLocationKind::Worker as i32,
+                worker_id: Some((*worker_id).into()),
+                job_id: key.job_id.into(),
+                stage: key.stage as u64,
+                partition: key.partition as u64,
+                attempt: key.attempt as u64,
+                channel: key.channel as u64,
+            }),
+            TaskReadLocation::Remote { uri, .. } => {
+                plan_err!("remote local checkpoint locations are not supported: {uri}")
+            }
+        }
     }
 
     fn try_decode_statistics(&self, buf: &[u8]) -> Result<Statistics> {

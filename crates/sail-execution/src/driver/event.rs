@@ -13,10 +13,10 @@ use sail_telemetry::common::{SpanAssociation, SpanAttribute};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use crate::driver::gen;
+use crate::driver::{gen, LocalCheckpointStreamOwner};
 use crate::error::ExecutionResult;
 use crate::id::{JobId, TaskKey, TaskStreamKey, WorkerId};
-use crate::stream::reader::TaskStreamSource;
+use crate::stream::reader::{TaskReadLocation, TaskStreamSource};
 use crate::stream::writer::{LocalStreamStorage, TaskStreamSink};
 
 pub enum DriverEvent {
@@ -54,6 +54,24 @@ pub enum DriverEvent {
         plan: Arc<dyn ExecutionPlan>,
         context: Arc<TaskContext>,
         result: oneshot::Sender<ExecutionResult<SendableRecordBatchStream>>,
+    },
+    BeginLocalCheckpointMaterialization {
+        checkpoint_job_id: JobId,
+        partitions: usize,
+        result: oneshot::Sender<ExecutionResult<()>>,
+    },
+    RegisterLocalCheckpointPartition {
+        checkpoint_job_id: JobId,
+        key: TaskStreamKey,
+        owner: LocalCheckpointStreamOwner,
+    },
+    FinalizeLocalCheckpointMaterialization {
+        checkpoint_job_id: JobId,
+        result: oneshot::Sender<ExecutionResult<Vec<TaskReadLocation>>>,
+    },
+    RemoveLocalCheckpointMaterialization {
+        checkpoint_job_id: JobId,
+        result: oneshot::Sender<ExecutionResult<()>>,
     },
     CleanUpJob {
         job_id: JobId,
@@ -162,6 +180,18 @@ impl SpanAssociation for DriverEvent {
             DriverEvent::ProbeIdleWorker { .. } => "ProbeIdleWorker",
             DriverEvent::ProbeLostWorker { .. } => "ProbeLostWorker",
             DriverEvent::ExecuteJob { .. } => "ExecuteJob",
+            DriverEvent::BeginLocalCheckpointMaterialization { .. } => {
+                "BeginLocalCheckpointMaterialization"
+            }
+            DriverEvent::RegisterLocalCheckpointPartition { .. } => {
+                "RegisterLocalCheckpointPartition"
+            }
+            DriverEvent::FinalizeLocalCheckpointMaterialization { .. } => {
+                "FinalizeLocalCheckpointMaterialization"
+            }
+            DriverEvent::RemoveLocalCheckpointMaterialization { .. } => {
+                "RemoveLocalCheckpointMaterialization"
+            }
             DriverEvent::CleanUpJob { .. } => "CleanUpJob",
             DriverEvent::UpdateTask { .. } => "UpdateTask",
             DriverEvent::ProbePendingTask { .. } => "ProbePendingTask",
@@ -214,6 +244,54 @@ impl SpanAssociation for DriverEvent {
                 context: _,
                 result: _,
             } => {}
+            DriverEvent::BeginLocalCheckpointMaterialization {
+                checkpoint_job_id,
+                partitions,
+                result: _,
+            } => {
+                p.push((
+                    SpanAttribute::EXECUTION_JOB_ID,
+                    checkpoint_job_id.to_string(),
+                ));
+                p.push((SpanAttribute::EXECUTION_PARTITION, partitions.to_string()));
+            }
+            DriverEvent::RegisterLocalCheckpointPartition {
+                checkpoint_job_id,
+                key:
+                    TaskStreamKey {
+                        stage,
+                        partition,
+                        attempt,
+                        channel,
+                        ..
+                    },
+                owner,
+            } => {
+                p.push((
+                    SpanAttribute::EXECUTION_JOB_ID,
+                    checkpoint_job_id.to_string(),
+                ));
+                p.push((SpanAttribute::EXECUTION_STAGE, stage.to_string()));
+                p.push((SpanAttribute::EXECUTION_PARTITION, partition.to_string()));
+                p.push((SpanAttribute::EXECUTION_ATTEMPT, attempt.to_string()));
+                p.push((SpanAttribute::EXECUTION_CHANNEL, channel.to_string()));
+                if let LocalCheckpointStreamOwner::Worker { worker_id } = owner {
+                    p.push((SpanAttribute::CLUSTER_WORKER_ID, worker_id.to_string()));
+                }
+            }
+            DriverEvent::FinalizeLocalCheckpointMaterialization {
+                checkpoint_job_id,
+                result: _,
+            }
+            | DriverEvent::RemoveLocalCheckpointMaterialization {
+                checkpoint_job_id,
+                result: _,
+            } => {
+                p.push((
+                    SpanAttribute::EXECUTION_JOB_ID,
+                    checkpoint_job_id.to_string(),
+                ));
+            }
             DriverEvent::CleanUpJob { job_id } => {
                 p.push((SpanAttribute::EXECUTION_JOB_ID, job_id.to_string()));
             }

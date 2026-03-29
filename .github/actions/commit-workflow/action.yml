@@ -16,7 +16,7 @@ inputs:
 outputs:
   workflow_run_id:
     description: The ID of the workflow run for the commit, or empty if the workflow run does not exist
-    value: ${{ steps.workflow.outputs.result }}
+    value: ${{ steps.workflow.outputs.workflow_run_id }}
 runs:
   using: composite
   steps:
@@ -27,7 +27,6 @@ runs:
         WORKFLOW_NAME: ${{ inputs.workflow_name }}
         ARTIFACT_NAME: ${{ inputs.artifact_name }}
       with:
-        result-encoding: string
         # We may return the workflow run ID when the artifact is about to expire.
         # The dependent job may fail when downloading the artifact that has just expired.
         # This is acceptable since this race condition is rare in practice.
@@ -35,21 +34,22 @@ runs:
           const workflows = await github.paginate(github.rest.actions.listWorkflowRunsForRepo.endpoint.merge({
             owner: context.repo.owner,
             repo: context.repo.repo,
-            status: 'success',
             head_sha: process.env.COMMIT_SHA,
           }));
           for (const workflow of workflows) {
-            if (workflow.name === process.env.WORKFLOW_NAME) {
-              const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts.endpoint.merge({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                run_id: workflow.id,
-              }));
-              for (const artifact of artifacts) {
-                if (artifact.name === process.env.ARTIFACT_NAME && artifact.expired === false) {
-                  return workflow.id;
-                }
+            if (workflow.name !== process.env.WORKFLOW_NAME) {
+              continue;
+            }
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts.endpoint.merge({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: workflow.id,
+            }));
+            for (const artifact of artifacts) {
+              if (artifact.name === process.env.ARTIFACT_NAME && artifact.expired === false) {
+                core.setOutput('workflow_run_id', String(workflow.id));
+                return;
               }
             }
           }
-          return '';
+          core.setOutput('workflow_run_id', '');

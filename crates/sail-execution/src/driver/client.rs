@@ -4,11 +4,11 @@ use crate::driver::event::TaskStatus;
 use crate::driver::gen;
 use crate::driver::gen::driver_service_client::DriverServiceClient;
 use crate::driver::gen::{
-    RegisterWorkerRequest, RegisterWorkerResponse, ReportTaskStatusRequest,
-    ReportTaskStatusResponse,
+    RegisterWorkerRequest, RegisterWorkerResponse, ReportLocalCheckpointPartitionRequest,
+    ReportLocalCheckpointPartitionResponse, ReportTaskStatusRequest, ReportTaskStatusResponse,
 };
 use crate::error::{ExecutionError, ExecutionResult};
-use crate::id::{TaskKey, WorkerId};
+use crate::id::{JobId, TaskKey, WorkerId};
 use crate::rpc::{ClientHandle, ClientOptions, ClientService};
 use crate::stream_service::TaskStreamFlightClient;
 
@@ -115,6 +115,31 @@ impl DriverClient {
         });
         let response = self.inner.get().await?.report_task_status(request).await?;
         let ReportTaskStatusResponse {} = response.into_inner();
+        Ok(())
+    }
+
+    pub async fn report_local_checkpoint_partition(
+        &self,
+        checkpoint_job_id: JobId,
+        partition: usize,
+        attempt: usize,
+        channel: usize,
+        worker_id: WorkerId,
+    ) -> ExecutionResult<()> {
+        let request = tonic::Request::new(ReportLocalCheckpointPartitionRequest {
+            checkpoint_job_id: checkpoint_job_id.into(),
+            partition: partition as u64,
+            attempt: attempt as u64,
+            channel: channel as u64,
+            worker_id: worker_id.into(),
+        });
+        let response = self
+            .inner
+            .get()
+            .await?
+            .report_local_checkpoint_partition(request)
+            .await?;
+        let ReportLocalCheckpointPartitionResponse {} = response.into_inner();
         Ok(())
     }
 }

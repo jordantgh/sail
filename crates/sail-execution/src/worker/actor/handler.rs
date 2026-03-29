@@ -12,6 +12,7 @@ use crate::id::{JobId, TaskKey, TaskStreamKey, WorkerId};
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{LocalStreamStorage, TaskStreamSink};
 use crate::task::definition::TaskDefinition;
+use crate::task_runner::LocalCheckpointRegistrarContext;
 use crate::worker::actor::WorkerActor;
 use crate::worker::event::{WorkerLocation, WorkerStreamOwner};
 use crate::worker::WorkerEvent;
@@ -105,8 +106,16 @@ impl WorkerActor {
         peers: Vec<WorkerLocation>,
     ) -> ActorAction {
         self.peer_tracker.track(ctx, peers);
-        self.task_runner
-            .run_task(ctx, key, definition, self.options.session.task_ctx());
+        self.task_runner.run_task(
+            ctx,
+            key,
+            definition,
+            self.options.session.task_ctx(),
+            LocalCheckpointRegistrarContext::Worker {
+                driver: self.driver_client_set.core.clone(),
+                worker_id: self.options.worker_id,
+            },
+        );
         ActorAction::Continue
     }
 
